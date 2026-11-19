@@ -289,6 +289,7 @@ class PolicyTests(unittest.TestCase):
 
         self.settings["queue_capacity"] = 1
         runtime.apply_settings()
+        self.assertEqual(runtime.tasks.qsize(), 1)
         runtime._handle_event(self.event(4))
 
         self.assertEqual(runtime.tasks.qsize(), 1)

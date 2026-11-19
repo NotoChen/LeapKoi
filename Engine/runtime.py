@@ -703,13 +703,29 @@ class ApplicationRuntime(core.ListenerRuntime):
                 self.tasks.maxsize = current["queue_capacity"]
             # The mark-read worker uses a separate bounded queue. Keep its
             # capacity aligned with the approval queue when settings change.
-            self._mark_read_tasks.maxsize = max(1, current["queue_capacity"])
+            with self._mark_read_tasks.mutex:
+                self._mark_read_tasks.maxsize = max(1, current["queue_capacity"])
+            self._trim_queue_to_capacity()
         self.max_urls = current["max_mrs_per_message"]
         self.reconnect_delays = tuple(current["reconnect_delays"])
         if hasattr(self.engine, "apply_settings"):
             self.engine.apply_settings(current)
         else:
             self.engine.settings = current
+
+    def _trim_queue_to_capacity(self) -> None:
+        """Discard waiting messages if a live setting reduced queue capacity."""
+        while True:
+            with self.tasks.mutex:
+                if len(self.tasks.queue) <= self.tasks.maxsize:
+                    return
+            try:
+                task = self.tasks.get_nowait()
+            except queue.Empty:
+                return
+            if task is not None:
+                self._discard(task, "队列容量已调整，移除超出上限的等待消息")
+            self.tasks.task_done()
 
     def emit_state(self) -> None:
         status = self.connection
