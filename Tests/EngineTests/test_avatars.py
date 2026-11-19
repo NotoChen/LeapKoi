@@ -253,6 +253,25 @@ class AvatarTests(unittest.TestCase):
             members = dws.group_members("group-id", "测试群")
         self.assertEqual(members[0].avatar_media_id, self.url)
 
+    def test_group_members_skip_entries_without_a_usable_identity(self):
+        payload = {
+            "success": True,
+            "result": {
+                "hasMore": False,
+                "list": [
+                    {"memberEmpName": "无开放 ID 的成员"},
+                    {"memberEmpName": self.contact.name,
+                     "openDingtalkId": self.contact.open_dingtalk_id},
+                    {"memberEmpName": "", "openDingtalkId": "ignored"},
+                ],
+            },
+        }
+        completed = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+        dws = core.DwsClient("/fixture/dws", Mock(), "corp:account")
+        with patch("listener_core.run_read_command", return_value=completed):
+            members = dws.group_members("group-id", "测试群")
+        self.assertEqual([member.name for member in members], [self.contact.name])
+
     def resolver(self, lookup, publish):
         resolver = SenderAvatars(lookup, publish)
         self.addCleanup(lambda: resolver.pool.shutdown(wait=True, cancel_futures=True))
@@ -294,7 +313,7 @@ class AvatarTests(unittest.TestCase):
             resolver.request(self.contact, "task-2")
             submit.assert_called_once()
             self.assertEqual(updates, [])
-            now.return_value = 401
+            now.return_value = 161
             resolver.request(self.contact, "task-3")
             self.assertEqual(submit.call_count, 2)
             self.assertEqual(updates, [("task-3", self.url)])

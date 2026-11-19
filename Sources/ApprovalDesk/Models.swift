@@ -271,7 +271,7 @@ struct MRItem: Identifiable, Equatable {
         if let v = data["commit_count"] as? Int { commitCount = v }
         if let v = data["author"] as? String { author = v }
         if let v = data["actor"] as? String { actor = v }
-        if let v = data["merged_by"] as? String { mergedBy = v }
+        if let v = data["merged_by"] as? String, !v.isEmpty { mergedBy = v }
         if let v = data["sha"] as? String { sha = v }
         if let v = data["error"] as? String { error = v }
         if let v = data["elapsed"] as? Double { elapsed = v }

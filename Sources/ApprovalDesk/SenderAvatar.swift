@@ -25,6 +25,15 @@ final class AvatarImageCache {
         return allowedHostSuffixes.contains { host == $0 || host.hasSuffix("." + $0) }
     }
 
+    private nonisolated static func thumbnail(from data: Data) -> CGImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 128
+        ] as CFDictionary)
+    }
+
     func image(for url: URL) async -> NSImage? {
         guard Self.isAllowed(url) else { return nil }
         if let image = images.object(forKey: url as NSURL) { return image }
@@ -35,14 +44,20 @@ final class AvatarImageCache {
                 let (data, response) = try await session.data(for: request)
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200,
                       data.count <= Self.maximumBytes,
-                      http.expectedContentLength <= Int64(Self.maximumBytes) || http.expectedContentLength < 0,
-                      let source = CGImageSourceCreateWithData(data as CFData, nil),
-                      let bitmap = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                        kCGImageSourceCreateThumbnailFromImageAlways: true,
-                        kCGImageSourceCreateThumbnailWithTransform: true,
-                        kCGImageSourceThumbnailMaxPixelSize: 128
-                      ] as CFDictionary) else { return nil }
-                return NSImage(cgImage: bitmap, size: .zero)
+                      http.expectedContentLength <= Int64(Self.maximumBytes) || http.expectedContentLength < 0 else {
+                    return nil
+                }
+                // Image decoding can be a few milliseconds per image. Run it
+                // away from the main actor so a burst of avatars cannot delay
+                // task list updates or approval controls.
+                let bitmap = await Task.detached(priority: .utility) {
+                    Self.thumbnail(from: data)
+                }.value
+                guard let bitmap else { return nil }
+                return NSImage(
+                    cgImage: bitmap,
+                    size: NSSize(width: bitmap.width, height: bitmap.height)
+                )
             } catch { return nil }
         }
         requests[url] = pending

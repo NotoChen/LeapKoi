@@ -85,6 +85,9 @@ class ApplicationEngine(core.ApprovalEngine):
         self._approval_prefetch_lock = threading.Lock()
         self._approval_prefetch: dict[str, Future[core.ApprovalInfo]] = {}
         self._metadata_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mr-metadata")
+        # Commit count is display-only and may paginate. Keep it away from the
+        # approver refresh so the attribution update cannot be delayed by it.
+        self._commit_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mr-commit-count")
         self._metadata_lock = threading.Lock()
         self._metadata_pending: set[tuple[str, str]] = set()
         self._approval_refresh_pending: set[tuple[str, str]] = set()
@@ -114,6 +117,7 @@ class ApplicationEngine(core.ApprovalEngine):
         self._approval_pool.shutdown(wait=False, cancel_futures=True)
         self._approval_prefetch_pool.shutdown(wait=False, cancel_futures=True)
         self._metadata_pool.shutdown(wait=False, cancel_futures=True)
+        self._commit_pool.shutdown(wait=False, cancel_futures=True)
 
     def _run_limited(self, ref: core.MRRef, index: int, total: int):
         """Run one MR while allowing live concurrency changes to take effect."""
@@ -169,6 +173,7 @@ class ApplicationEngine(core.ApprovalEngine):
             if details is not None:
                 self._publish_details(details)
             raise
+        self._publish_details(plan.details, actor=plan.actor.name)
         self._publish_approvals(ref, plan.approvals, plan.approvals_known)
         return plan
 
@@ -298,7 +303,7 @@ class ApplicationEngine(core.ApprovalEngine):
                 return
             self._metadata_pending.add(pending_key)
         try:
-            self._metadata_pool.submit(load)
+            self._commit_pool.submit(load)
         except RuntimeError:
             with self._metadata_lock:
                 self._metadata_pending.discard(pending_key)
@@ -823,27 +828,24 @@ class ApplicationRuntime(core.ListenerRuntime):
                 quoted=used_quote,
                 summary="等待手动恢复" if reason == "paused" else "等待解锁" if reason == "locked" else "等待处理",
             )
-            try:
-                self.tasks.put_nowait(task)
-            except queue.Full:
-                if settings["queue_overflow_policy"] == "drop_oldest":
+            while True:
+                try:
+                    self.tasks.put_nowait(task)
+                    break
+                except queue.Full:
+                    if settings["queue_overflow_policy"] != "drop_oldest":
+                        self._discard(task, "队列已满，按设置丢弃了新消息")
+                        self.emit_state()
+                        return
                     try:
                         old = self.tasks.get_nowait()
-                        if old is not None:
-                            self._discard(old, "队列已满，按设置移除了最早的待处理消息")
-                        self.tasks.task_done()
                     except queue.Empty:
-                        pass
-                    try:
-                        self.tasks.put_nowait(task)
-                    except queue.Full:
                         self._discard(task, "队列已满，未加入队列")
                         self.emit_state()
                         return
-                else:
-                    self._discard(task, "队列已满，按设置丢弃了新消息")
-                    self.emit_state()
-                    return
+                    if old is not None:
+                        self._discard(old, "队列已满，按设置移除了最早的待处理消息")
+                    self.tasks.task_done()
             self.enqueued[key] = time.monotonic()
             self.recent_messages.add_if_new(key)
         self.emit_state()
@@ -960,7 +962,7 @@ class ApplicationRuntime(core.ListenerRuntime):
 
     def _relay_dws_status(self, stream: Any, ready_event: threading.Event, status_lines: list[str]) -> None:
         for line in stream:
-            status = line.strip()
+            status = core.ANSI_ESCAPE_RE.sub("", line).strip()
             if not status:
                 continue
             status_lines.append(status)
@@ -1147,4 +1149,20 @@ class ApplicationRuntime(core.ListenerRuntime):
                 self._mark_read_thread.join(timeout=2)
             self.monitor_stop.set()
             monitor.join(timeout=6)
+            self._cleanup_idle_bus_after_listen()
         return 0
+
+    def _cleanup_idle_bus_after_listen(self) -> None:
+        """Stop the local bus once its last consumer has exited."""
+        cleanup = getattr(self.dws, "recover_stale_event_bus", None)
+        if not callable(cleanup):
+            return
+        try:
+            recovered, message = cleanup(timeout=5)
+        except Exception as error:
+            self.console.debug(f"停止后清理 DWS 事件总线失败：{error!r}")
+            return
+        if recovered:
+            self.console.success(message)
+        else:
+            self.console.debug(message)

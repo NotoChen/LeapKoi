@@ -1707,7 +1707,8 @@ class DwsClient:
                 if not name:
                     continue
                 if not open_id:
-                    raise AutomationError(f"群成员 {name} 缺少 openDingTalkId")
+                    self.console.debug(f"跳过无法识别 openDingTalkId 的群成员：{name}")
+                    continue
                 members[open_id] = ContactCandidate(
                     name=name,
                     user_id="",
@@ -1731,8 +1732,13 @@ class DwsClient:
         self,
         group_name: str,
     ) -> tuple[GroupCandidate, ContactCandidate, dict[str, ContactCandidate]]:
-        group = self.resolve_group(group_name)
-        self_candidate = self.self_contact()
+        # Group lookup and self-identity lookup are independent reads. Resolve
+        # them together so startup does not pay for two serial CLI round trips.
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="dws-group") as pool:
+            group_future = pool.submit(self.resolve_group, group_name)
+            self_future = pool.submit(self.self_contact)
+            group = group_future.result()
+            self_candidate = self_future.result()
         members = self.group_members(group.open_conversation_id, group_name)
         if not members:
             raise AutomationError(f"群聊 {group_name} 没有可识别的成员")

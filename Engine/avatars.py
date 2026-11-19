@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 import listener_core as core
 
 AVATAR_HOST_SUFFIXES = ("dingtalk.com", "alicdn.com")
+AVATAR_FAILURE_TTL_SECONDS = 60
 
 
 def allowed_avatar_url(value: str) -> bool:
@@ -250,8 +251,12 @@ class SenderAvatars:
             if self.closed:
                 return
             # Successful addresses last for this listening session. Missing or
-            # failed lookups can be retried by a later request after five minutes.
-            self.cache[sender_id] = (url, float("inf") if url else time.monotonic() + 300)
+            # failed lookups can be retried by a later request without waiting
+            # for a long negative-cache window.
+            self.cache[sender_id] = (
+                url,
+                float("inf") if url else time.monotonic() + AVATAR_FAILURE_TTL_SECONDS,
+            )
             for task_id in task_ids:
                 if url:
                     self.publish(task_id, url)

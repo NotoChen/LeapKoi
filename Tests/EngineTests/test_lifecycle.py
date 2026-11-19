@@ -79,6 +79,13 @@ class LifecycleTests(unittest.TestCase):
         finally:
             core.MAX_URLS = saved
 
+    def test_idle_bus_is_cleaned_up_after_the_listener_stops(self):
+        runtime, _, dws, output = self.runtime("pass")
+        dws.recover_stale_event_bus.return_value = (True, "已正常停止旧 DWS 事件总线 4242")
+        runtime._cleanup_idle_bus_after_listen()
+        dws.recover_stale_event_bus.assert_called_with(timeout=5)
+        self.assertTrue(any(event.get("message") == "已正常停止旧 DWS 事件总线 4242" for event in output))
+
 
 class EventBusRecoveryTests(unittest.TestCase):
     pid = 4242

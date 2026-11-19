@@ -280,6 +280,22 @@ class PolicyTests(unittest.TestCase):
             self.stop.set(); release.set(); runtime.tasks.put(None, timeout=2); thread.join(2)
         self.assertFalse(thread.is_alive())
 
+    def test_shrinking_queue_capacity_removes_all_surplus_waiting_messages(self):
+        self.settings["queue_capacity"] = 3
+        runtime = self.runtime()
+        for number in (1, 2, 3):
+            runtime._handle_event(self.event(number))
+        self.assertEqual(runtime.tasks.qsize(), 3)
+
+        self.settings["queue_capacity"] = 1
+        runtime.apply_settings()
+        runtime._handle_event(self.event(4))
+
+        self.assertEqual(runtime.tasks.qsize(), 1)
+        self.assertEqual(runtime.tasks.get_nowait().message_id, "message-4")
+        discarded = [event["id"] for event in self.output if event.get("status") == "discarded"]
+        self.assertEqual(discarded, ["event-1", "event-2", "event-3"])
+
     def test_clear_queue_does_not_mark_messages_read(self):
         runtime = self.runtime()
         runtime._handle_event(self.event(1)); runtime._handle_event(self.event(2))

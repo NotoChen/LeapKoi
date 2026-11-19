@@ -383,6 +383,16 @@ class ExecutionTests(unittest.TestCase):
             worker.join(2)
         self.assertFalse(worker.is_alive())
 
+    def test_preflight_publishes_the_actual_local_actor_before_approval(self):
+        ref = self.glab.add()
+        self.process(ref)
+        actor_events = [
+            event for event in self.events
+            if event["type"] == "mr" and event.get("key") == ref.key and event.get("actor")
+        ]
+        self.assertTrue(actor_events)
+        self.assertEqual(actor_events[-1]["actor"], "本人")
+
     def test_task_completion_is_visible_before_the_dingtalk_receipt_finishes(self):
         ref = self.glab.add()
         receipt_started = threading.Event()

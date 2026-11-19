@@ -184,30 +184,155 @@ class Controller:
         self.console.debug_enabled = settings["debug_output"]
         dws_path = executable("dws", settings)
         glab_path = executable("glab", settings)
+
         def require(path, label):
             if not path:
                 raise core.AutomationError(f"没有找到 {label}，请在高级设置中选择可执行文件")
             return f"{core.tool_version(path, label)} · {path}"
-        self.check("dws", "钉钉连接组件", lambda: require(dws_path, "DWS"))
-        self.check("glab", "GitLab 连接组件", lambda: require(glab_path, "glab"))
-        dws = AppDws(dws_path, self.console, settings)
-        auth = self.check("dws_auth", "钉钉账号", lambda: core.ensure_dws_authentication(dws, console=self.console, allow_setup=False))
-        self.events.send("identity", service="dingtalk", name=auth.get("user_name", ""), detail=auth.get("corp_name", ""), profile=dws.profile)
-        self.check("subscription", "消息订阅能力", lambda: dws.validate_consume() or "支持 @我 消息监听")
-        approval = self.check("approval_group", "审批消息群", lambda: dws.resolve_group(settings["approval_group"]))
-        sender_group, self_contact, allowed = self.check("sender_group", "人员来源群", lambda: dws.resolve_group_senders(settings["sender_group"]))
-        self.events.send("members", group=sender_group.title, members=[{"id": p.open_dingtalk_id, "name": p.name, "detail": p.nick or p.title} for p in allowed.values()])
-        glab = AppGlab(glab_path, self.console, settings)
-        self.check("gitlab_api", "GitLab 接口能力", lambda: glab.validate_capabilities() or "审批与合并接口可用")
-        identity = self.check("gitlab_auth", "GitLab 账号", lambda: glab.identity())
-        self.events.send("identity", service="gitlab", name=identity.name, detail=identity.username, profile=settings["gitlab_host"])
-        leader = None
-        if settings["fallback_token"]:
-            leader = self.check("fallback", "备用审批账号", lambda: glab.identity(True))
-            if leader.user_id == identity.user_id:
-                raise core.AutomationError("备用账号与当前 GitLab 账号相同，请选择其他账号")
-        else:
-            self.events.send("check", id="fallback", title="备用审批账号", status="optional", detail="未配置，自己创建的 MR 将跳过")
+
+        # DingTalk and GitLab checks do not share credentials or mutable state.
+        # Running the two branches together removes the startup cost of one
+        # external CLI/API round trip from the other.
+        results: dict[str, tuple] = {}
+        errors: list[Exception] = []
+
+        def inspect_dws():
+            try:
+                self.check("dws", "钉钉连接组件", lambda: require(dws_path, "DWS"))
+                dws = AppDws(dws_path, self.console, settings)
+                auth = self.check(
+                    "dws_auth",
+                    "钉钉账号",
+                    lambda: core.ensure_dws_authentication(
+                        dws,
+                        console=self.console,
+                        allow_setup=False,
+                    ),
+                )
+                self.events.send(
+                    "identity",
+                    service="dingtalk",
+                    name=auth.get("user_name", ""),
+                    detail=auth.get("corp_name", ""),
+                    profile=dws.profile,
+                )
+                # These are read-only and independent. In particular, the
+                # sender group and approval group searches should not wait for
+                # one another during startup.
+                with ThreadPoolExecutor(max_workers=3, thread_name_prefix="dws-startup") as pool:
+                    futures = {
+                        "subscription": pool.submit(
+                            self.check,
+                            "subscription",
+                            "消息订阅能力",
+                            lambda: dws.validate_consume() or "支持 @我 消息监听",
+                        ),
+                        "approval": pool.submit(
+                            self.check,
+                            "approval_group",
+                            "审批消息群",
+                            lambda: dws.resolve_group(settings["approval_group"]),
+                        ),
+                        "sender": pool.submit(
+                            self.check,
+                            "sender_group",
+                            "人员来源群",
+                            lambda: dws.resolve_group_senders(settings["sender_group"]),
+                        ),
+                    }
+                    values: dict[str, Any] = {}
+                    problems: list[Exception] = []
+                    for name, future in futures.items():
+                        try:
+                            values[name] = future.result()
+                        except Exception as error:
+                            problems.append(error)
+                if problems:
+                    raise problems[0]
+                approval = values["approval"]
+                sender_group, self_contact, allowed = values["sender"]
+                self.events.send(
+                    "members",
+                    group=sender_group.title,
+                    members=[
+                        {"id": p.open_dingtalk_id, "name": p.name, "detail": p.nick or p.title}
+                        for p in allowed.values()
+                    ],
+                )
+                results["dws"] = (dws, approval, sender_group, self_contact, allowed)
+            except Exception as error:
+                errors.append(error)
+
+        def inspect_glab():
+            try:
+                self.check("glab", "GitLab 连接组件", lambda: require(glab_path, "glab"))
+                glab = AppGlab(glab_path, self.console, settings)
+                self.check(
+                    "gitlab_api",
+                    "GitLab 接口能力",
+                    lambda: glab.validate_capabilities() or "审批与合并接口可用",
+                )
+                if settings["fallback_token"]:
+                    # Primary and fallback identities use different tokens and
+                    # can be read without making one wait for the other.
+                    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="gitlab-startup") as pool:
+                        identity_future = pool.submit(
+                            self.check,
+                            "gitlab_auth",
+                            "GitLab 账号",
+                            lambda: glab.identity(),
+                        )
+                        fallback_future = pool.submit(
+                            self.check,
+                            "fallback",
+                            "备用审批账号",
+                            lambda: glab.identity(True),
+                        )
+                        problems: list[Exception] = []
+                        try:
+                            identity = identity_future.result()
+                        except Exception as error:
+                            problems.append(error)
+                            identity = None
+                        try:
+                            leader = fallback_future.result()
+                        except Exception as error:
+                            problems.append(error)
+                            leader = None
+                    if problems:
+                        raise problems[0]
+                    assert identity is not None and leader is not None
+                else:
+                    identity = self.check("gitlab_auth", "GitLab 账号", lambda: glab.identity())
+                    leader = None
+                self.events.send(
+                    "identity",
+                    service="gitlab",
+                    name=identity.name,
+                    detail=identity.username,
+                    profile=settings["gitlab_host"],
+                )
+                if leader is not None:
+                    if leader.user_id == identity.user_id:
+                        raise core.AutomationError("备用账号与当前 GitLab 账号相同，请选择其他账号")
+                else:
+                    self.events.send(
+                        "check",
+                        id="fallback",
+                        title="备用审批账号",
+                        status="optional",
+                        detail="未配置，自己创建的 MR 将跳过",
+                    )
+                results["glab"] = (glab, identity, leader)
+            except Exception as error:
+                errors.append(error)
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="startup-check") as pool:
+            list(pool.map(lambda action: action(), (inspect_dws, inspect_glab)))
+        if errors:
+            raise errors[0]
+        dws, approval, sender_group, self_contact, allowed = results["dws"]
+        glab, identity, leader = results["glab"]
         return dws, glab, approval, sender_group, self_contact, allowed, identity, leader
 
     def inspect(self):
