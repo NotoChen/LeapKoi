@@ -1,5 +1,6 @@
 import base64
 from concurrent.futures import Future
+from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
@@ -16,7 +17,7 @@ from avatars import SenderAvatars, avatar_url, lookup_sender_avatar
 class AvatarTests(unittest.TestCase):
     def setUp(self):
         self.contact = core.ContactCandidate("测试成员", "employee", "exact-open-id", "", "", "")
-        self.url = "https://example.test/avatar.jpg"
+        self.url = "https://static-legacy.dingtalk.com/avatar.jpg"
 
     def test_media_id_uses_source_dimensions_and_requests_a_thumbnail(self):
         raw = b"\x94\x00\xcf" + (123456).to_bytes(8, "big") + b"\xcd\x0b\xd0\xcd\x0b\xd5"
@@ -50,6 +51,25 @@ class AvatarTests(unittest.TestCase):
         malformed = base64.urlsafe_b64encode(raw[:-1]).decode().rstrip("=")
         self.assertEqual(avatar_url("@" + malformed), "")
 
+    def test_five_item_media_id_uses_dimensions_and_accepts_the_opaque_suffix(self):
+        raw = (b"\x95\x02\xcf" + (123456).to_bytes(8, "big")
+               + b"\xcd\x05\x00\xcd\x05\x00" + b"\xb0" + b"0123456789abcdef")
+        media = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        self.assertEqual(
+            avatar_url("@" + media),
+            f"https://static-legacy.dingtalk.com/media/{media}_1280_1280.png_128x128.jpg",
+        )
+        malformed = base64.urlsafe_b64encode(raw[:-1]).decode().rstrip("=")
+        self.assertEqual(avatar_url("@" + malformed), "")
+
+        nil_suffix = (b"\x95\x02\xcf" + (123456).to_bytes(8, "big")
+                      + b"\xcd\x05\x00\xcd\x05\x00" + b"\xc0")
+        nil_media = base64.urlsafe_b64encode(nil_suffix).decode().rstrip("=")
+        self.assertIn(
+            "_1280_1280.png_128x128.jpg",
+            avatar_url("@" + nil_media),
+        )
+
     def lookup(self, rows):
         dws = core.DwsClient("/fixture/dws", Mock(), "corp:account")
         result = subprocess.CompletedProcess([], 0, json.dumps({"success": True, "result": rows}), "")
@@ -60,7 +80,7 @@ class AvatarTests(unittest.TestCase):
 
     def test_same_name_never_substitutes_for_exact_group_member_identity(self):
         self.assertEqual(self.lookup([
-            {"title": "测试成员", "openDingTalkId": "other-person", "authorAvatar": "https://example.test/wrong.jpg"},
+            {"title": "测试成员", "openDingTalkId": "other-person", "authorAvatar": "https://static-legacy.dingtalk.com/wrong.jpg"},
             {"title": "测试成员", "openDingTalkId": self.contact.open_dingtalk_id, "authorAvatar": self.url},
         ]), self.url)
         self.assertEqual(self.lookup([{"title": "测试成员", "openDingTalkId": "other-person", "authorAvatar": self.url}]), "")
@@ -69,7 +89,7 @@ class AvatarTests(unittest.TestCase):
         self.assertEqual(self.lookup([{"openDingTalkId": self.contact.open_dingtalk_id, "authorAvatar": None}]), "")
         self.assertEqual(self.lookup([
             {"openDingTalkId": self.contact.open_dingtalk_id, "authorAvatar": self.url},
-            {"openDingTalkId": self.contact.open_dingtalk_id, "authorAvatar": "https://example.test/other.jpg"},
+            {"openDingTalkId": self.contact.open_dingtalk_id, "authorAvatar": "https://static-legacy.dingtalk.com/other.jpg"},
         ]), "")
 
     def test_exact_sender_lookup_uses_the_returned_png_format(self):
@@ -77,6 +97,43 @@ class AvatarTests(unittest.TestCase):
         media = base64.urlsafe_b64encode(raw).decode().rstrip("=")
         url = self.lookup([{"openDingTalkId": self.contact.open_dingtalk_id, "authorAvatar": "@" + media}])
         self.assertEqual(url, f"https://static-legacy.dingtalk.com/media/{media}_1280_1280.png_128x128.jpg")
+
+    def test_group_avatar_is_used_without_an_extra_aisearch_lookup(self):
+        raw = b"\x94\x00\xcf" + (123456).to_bytes(8, "big") + b"\xcd\x02\x80\xcd\x02\x80"
+        media = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        contact = replace(self.contact, avatar_media_id="@" + media)
+        dws = core.DwsClient("/fixture/dws", Mock(), "corp:account")
+        with patch("avatars.core.run_command") as call:
+            self.assertEqual(
+                lookup_sender_avatar(dws, contact),
+                f"https://static-legacy.dingtalk.com/media/{media}_640_640.jpg_128x128.jpg",
+            )
+            call.assert_not_called()
+
+    def test_group_members_keep_the_supplied_avatar_media_id(self):
+        raw = b"\x95\x02\xcf" + (123456).to_bytes(8, "big") + b"\xcd\x02\x80\xcd\x02\x80" + b"\xb0" + b"0123456789abcdef"
+        media = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        payload = {
+            "success": True,
+            "result": {
+                "hasMore": False,
+                "list": [{
+                    "memberEmpName": self.contact.name,
+                    "openDingtalkId": self.contact.open_dingtalk_id,
+                    "memberAvatarMediaId": "@" + media,
+                }],
+            },
+        }
+        completed = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+        dws = core.DwsClient("/fixture/dws", Mock(), "corp:account")
+        with patch("listener_core.run_read_command", return_value=completed):
+            members = dws.group_members("group-id", "测试群")
+        self.assertEqual(len(members), 1)
+        self.assertEqual(members[0].avatar_media_id, "@" + media)
+        self.assertEqual(
+            lookup_sender_avatar(dws, members[0]),
+            f"https://static-legacy.dingtalk.com/media/{media}_640_640.png_128x128.jpg",
+        )
 
     def resolver(self, lookup, publish):
         resolver = SenderAvatars(lookup, publish)

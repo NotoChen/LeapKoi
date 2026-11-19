@@ -95,23 +95,12 @@ def validate(raw: dict[str, Any]) -> dict[str, Any]:
         if not result[key].strip():
             raise ValueError("审批群、人员来源群和 GitLab 地址不能为空")
         result[key] = result[key].strip()
-    from listener_core import gitlab_hostname_argument
-    result["gitlab_host"] = gitlab_hostname_argument(result["gitlab_host"])
+    from listener_core import normalize_gitlab_hostname
+    try:
+        result["gitlab_host"] = normalize_gitlab_hostname(result["gitlab_host"])
+    except ValueError as error:
+        raise ValueError(str(error)) from error
     return result
-
-
-def configure_core(settings: dict[str, Any]) -> None:
-    import listener_core as core
-    for attr, key in {
-        "MAX_URLS": "max_mrs_per_message", "MAX_CONCURRENT_MRS": "max_concurrent_mrs",
-        "QUEUE_SIZE": "queue_capacity", "COMMAND_TIMEOUT_SECONDS": "command_timeout_seconds",
-        "MERGE_VERIFY_TIMEOUT_SECONDS": "merge_timeout_seconds",
-        "MERGE_VERIFY_INTERVAL_SECONDS": "merge_poll_seconds", "RETRY_ATTEMPTS": "max_attempts",
-        "RETRY_DELAYS_SECONDS": "retry_delays", "RECONNECT_DELAYS": "reconnect_delays",
-    }.items():
-        setattr(core, attr, settings[key])
-
-
 def executable(name: str, settings: dict[str, Any]) -> str | None:
     custom = settings.get(f"{name}_path", "").strip()
     if custom:

@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "Engine"))
 import listener_core as core
-from configuration import DEFAULTS, configure_core
+from configuration import DEFAULTS
 from protocol import Events, EventConsole, EventNotifier
 from runtime import ApplicationEngine, PolicyGate
 from worker import AppDws
@@ -93,7 +93,6 @@ class GitLabFake:
 class ExecutionTests(unittest.TestCase):
     def setUp(self):
         self.settings = dict(DEFAULTS)
-        configure_core(self.settings)
         self.events = []
         sink = Events(self.events.append)
         self.console = EventConsole(sink)
@@ -106,9 +105,6 @@ class ExecutionTests(unittest.TestCase):
         self.engine = ApplicationEngine(self.glab, self.dws, core.Identity(1, "本人", "me"), core.Identity(2, "备用", "backup"),
                                         self.console, EventNotifier(sink, lambda: self.settings), self.gate, self.stop,
                                         settings=self.settings, events=sink)
-
-    def tearDown(self):
-        configure_core(DEFAULTS)
 
     def process(self, *refs):
         self.engine.process(core.MessageTask("event", "message", "group", "发送人", tuple(refs)))
@@ -249,7 +245,67 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(result["owned_merge_count"], 0)
         self.assertEqual(result["other_merge_count"], 1)
         self.assertIn("本机合并 0 个，其他成员合并 1 个", result["summary"])
+        self.assertIn("审批人 本人（本机参与）", result["mr_summaries"][0])
+        self.assertIn("合并人 协作成员（其他成员）", result["mr_summaries"][0])
         self.assertEqual(self.receipts, [])
+
+    def test_task_update_explains_each_mr_with_actual_people(self):
+        ref = self.glab.add(state="merged", merged_by_id=20, merged_by_name="同事")
+        self.glab.approvers[1] = {20: "张三", 1: "本人"}
+        result = self.process(ref)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(
+            result["mr_summaries"],
+            ["erp/core!1：审批人 张三、本人（本机参与）；合并人 同事（其他成员）"],
+        )
+
+    def test_direct_client_prefetches_approval_state_while_details_are_loaded(self):
+        ref = self.glab.add()
+        self.glab.supports_parallel_approval_prefetch = True
+        approval_started = threading.Event()
+        details_released = threading.Event()
+        original_approvals = self.glab.approvals
+        original_details = self.glab.details
+
+        def approvals(ref, use_leader=False):
+            approval_started.set()
+            details_released.wait(2)
+            return original_approvals(ref, use_leader)
+
+        def details(ref):
+            self.assertTrue(approval_started.wait(2))
+            details_released.set()
+            return original_details(ref)
+
+        with patch.object(self.glab, "approvals", side_effect=approvals), \
+                patch.object(self.glab, "details", side_effect=details):
+            result = self.process(ref)
+        self.assertEqual(result["status"], "completed")
+
+    def test_task_completion_is_visible_before_the_dingtalk_receipt_finishes(self):
+        ref = self.glab.add()
+        receipt_started = threading.Event()
+        receipt_released = threading.Event()
+        original_receipt = self.dws.add_received
+
+        def slow_receipt(conversation, message):
+            receipt_started.set()
+            receipt_released.wait(2)
+            return original_receipt(conversation, message)
+
+        with patch.object(self.dws, "add_received", side_effect=slow_receipt):
+            worker = threading.Thread(target=self.engine.process,
+                                      args=(core.MessageTask("event", "message", "group", "发送人", (ref,)),))
+            worker.start()
+            self.assertTrue(receipt_started.wait(2))
+            updates = [event for event in self.events if event["type"] == "task_update"]
+            self.assertTrue(updates)
+            self.assertEqual(updates[-1]["status"], "completed")
+            self.assertFalse(updates[-1]["received"])
+            receipt_released.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.receipts, ["message"])
 
     def test_default_receipt_accepts_own_merge_plus_confirmed_other_merge(self):
         first, second = self.glab.add(), self.glab.add(2)
@@ -269,8 +325,9 @@ class ExecutionTests(unittest.TestCase):
 
     def test_merge_405_with_open_mr_does_not_invent_success(self):
         ref = self.glab.add()
-        with patch.object(self.glab, "merge", side_effect=self.merge_405) as merge, \
-             patch.object(core, "MERGE_VERIFY_TIMEOUT_SECONDS", 0), patch.object(core, "RETRY_ATTEMPTS", 1):
+        self.settings["merge_timeout_seconds"] = 0
+        self.settings["max_attempts"] = 1
+        with patch.object(self.glab, "merge", side_effect=self.merge_405) as merge:
             result = self.process(ref)
         self.assertEqual(merge.call_count, 1)
         self.assertEqual(result["merged_count"], 0)
@@ -303,9 +360,10 @@ class ExecutionTests(unittest.TestCase):
             if failed:
                 raise core.AutomationError("查询失败（HTTP 503）", "glab: Service Unavailable (HTTP 503)")
             return original_details(ref)
+        self.settings["max_attempts"] = 3
+        self.settings["retry_delays"] = [0]
         with patch.object(self.glab, "details", side_effect=details), \
-             patch.object(self.glab, "merge", side_effect=conflict) as merge, \
-             patch.object(core, "RETRY_ATTEMPTS", 3), patch.object(core, "RETRY_DELAYS_SECONDS", [0]):
+             patch.object(self.glab, "merge", side_effect=conflict) as merge:
             result = self.process(ref)
         self.assertEqual(merge.call_count, 1)
         self.assertIn("405", result["error"])
@@ -321,10 +379,11 @@ class ExecutionTests(unittest.TestCase):
         def during_backoff(_delay):
             self.finish_elsewhere(ref)
             return False
+        self.settings["merge_timeout_seconds"] = 0
+        self.settings["max_attempts"] = 2
+        self.settings["retry_delays"] = [0]
         with patch.object(self.stop, "wait", side_effect=during_backoff), \
-             patch.object(self.glab, "merge", side_effect=self.merge_405) as merge, \
-             patch.object(core, "MERGE_VERIFY_TIMEOUT_SECONDS", 0), \
-             patch.object(core, "RETRY_ATTEMPTS", 2), patch.object(core, "RETRY_DELAYS_SECONDS", [0]):
+             patch.object(self.glab, "merge", side_effect=self.merge_405) as merge:
             result = self.process(ref)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(merge.call_count, 1)
@@ -336,9 +395,10 @@ class ExecutionTests(unittest.TestCase):
         def after_poll(_plan, _initial=None):
             self.finish_elsewhere(ref)
             raise core.AutomationError("轮询未确认合并", retryable=True)
+        self.settings["merge_timeout_seconds"] = 0
+        self.settings["max_attempts"] = 1
         with patch.object(self.engine, "_wait_until_merged", side_effect=after_poll), \
-             patch.object(self.glab, "merge", side_effect=self.merge_405) as merge, \
-             patch.object(core, "MERGE_VERIFY_TIMEOUT_SECONDS", 0), patch.object(core, "RETRY_ATTEMPTS", 1):
+             patch.object(self.glab, "merge", side_effect=self.merge_405) as merge:
             result = self.process(ref)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(merge.call_count, 1)
@@ -409,6 +469,34 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(max(active), 2)
         self.assertEqual(self.engine.active_mrs, 0)
 
+    def test_parallel_task_publishes_completed_mr_before_slow_sibling(self):
+        first, second = self.glab.add(1), self.glab.add(2)
+        self.settings["max_concurrent_mrs"] = 2
+        progress_seen = threading.Event()
+        original_details = self.glab.details
+        original_progress = self.engine._publish_progress
+
+        def details(ref):
+            if ref == second:
+                self.assertTrue(progress_seen.wait(2))
+            return original_details(ref)
+
+        def progress(*args):
+            original_progress(*args)
+            progress_seen.set()
+
+        with patch.object(self.glab, "details", side_effect=details), \
+                patch.object(self.engine, "_publish_progress", side_effect=progress):
+            result = self.process(first, second)
+
+        updates = [event for event in self.events
+                   if event["type"] == "task_update" and event.get("status") == "running"]
+        self.assertTrue(updates)
+        self.assertTrue(any("erp/core!1" in rows[0] for rows in
+                            (event.get("mr_summaries", []) for event in updates) if rows))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["merged_count"], 2)
+
     def test_stopped_task_does_not_start_gitlab_calls(self):
         ref = self.glab.add()
         self.stop.set()
@@ -456,7 +544,8 @@ class ExecutionTests(unittest.TestCase):
         dws.stop_event = self.stop
         dws.gate = Mock()
         dws.gate.wait_until_unlocked.side_effect = [True, False]
-        with patch.object(core, "RETRY_DELAYS_SECONDS", [0]), patch.object(core, "run_command", side_effect=core.AutomationError("network", retryable=True)) as command:
+        dws.retry_delays = (0,)
+        with patch.object(core, "run_command", side_effect=core.AutomationError("network", retryable=True)) as command:
             with self.assertRaises(core.ProcessingStopped): dws.mark_read("group", "message")
             self.assertEqual(command.call_count, 1)
             self.assertEqual(dws.gate.wait_until_unlocked.call_count, 2)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import json
 import queue
 import subprocess
@@ -10,7 +10,6 @@ from typing import Any, Callable, Mapping
 
 import listener_core as core
 from avatars import SenderAvatars, lookup_sender_avatar
-from configuration import configure_core
 from lifecycle import startup_decision
 from protocol import Events, EventConsole, EventNotifier
 
@@ -53,7 +52,15 @@ class PolicyGate(core.ScreenLockGuard):
 
 class ApplicationEngine(core.ApprovalEngine):
     def __init__(self, *args: Any, settings: dict[str, Any], events: Events, **kwargs: Any):
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            *args,
+            max_concurrent_mrs=settings["max_concurrent_mrs"],
+            merge_verify_timeout_seconds=settings["merge_timeout_seconds"],
+            merge_verify_interval_seconds=settings["merge_poll_seconds"],
+            retry_attempts=settings["max_attempts"],
+            retry_delays=settings["retry_delays"],
+            **kwargs,
+        )
         self.settings = settings
         self.events = events
         self.task_id = ""
@@ -65,6 +72,66 @@ class ApplicationEngine(core.ApprovalEngine):
         self._stages: dict[str, str] = {}
         self._approved_refs: set[str] = set()
         self._merged_refs: set[str] = set()
+        # Keep worker threads alive across messages so their thread-local
+        # HTTPS connections can be reused instead of paying a TLS handshake
+        # for every MR.
+        self._approval_pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="approval-mr")
+        self._approval_cv = threading.Condition()
+        self._approval_active = 0
+        self._approval_prefetch_pool = ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="approval-prefetch",
+        )
+        self._approval_prefetch_lock = threading.Lock()
+        self._approval_prefetch: dict[str, Future[core.ApprovalInfo]] = {}
+        self._metadata_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mr-metadata")
+        self._metadata_lock = threading.Lock()
+        self._metadata_pending: set[str] = set()
+        self._closed = False
+
+    def apply_settings(self, settings: dict[str, Any]) -> None:
+        """Apply the latest task snapshot without mutating listener globals."""
+        self.settings = settings
+        self.max_concurrent_mrs = settings["max_concurrent_mrs"]
+        self.merge_verify_timeout_seconds = settings["merge_timeout_seconds"]
+        self.merge_verify_interval_seconds = settings["merge_poll_seconds"]
+        self.retry_attempts = settings["max_attempts"]
+        self.retry_delays = tuple(settings["retry_delays"])
+        for client in (getattr(self, "glab", None), getattr(self, "dws", None)):
+            if client is not None:
+                client.command_timeout = settings["command_timeout_seconds"]
+                client.retry_attempts = settings["max_attempts"]
+                client.retry_delays = tuple(settings["retry_delays"])
+
+    def close(self) -> None:
+        with self._metadata_lock:
+            if self._closed:
+                return
+            self._closed = True
+        with self._approval_cv:
+            self._approval_cv.notify_all()
+        self._approval_pool.shutdown(wait=False, cancel_futures=True)
+        self._approval_prefetch_pool.shutdown(wait=False, cancel_futures=True)
+        self._metadata_pool.shutdown(wait=False, cancel_futures=True)
+
+    def _run_limited(self, ref: core.MRRef, index: int, total: int):
+        """Run one MR while allowing live concurrency changes to take effect."""
+        with self._approval_cv:
+            while (
+                not self._closed
+                and not self.stop_event.is_set()
+                and self._approval_active >= max(1, self.max_concurrent_mrs)
+            ):
+                self._approval_cv.wait(timeout=0.5)
+            if self._closed or self.stop_event.is_set():
+                raise core.ProcessingStopped("监听正在停止，未继续执行 MR")
+            self._approval_active += 1
+        try:
+            return self._process_one(ref, index, total)
+        finally:
+            with self._approval_cv:
+                self._approval_active = max(0, self._approval_active - 1)
+                self._approval_cv.notify()
 
     def _mr(self, ref: core.MRRef, **fields: Any) -> None:
         self.events.send("mr", task_id=self.task_id, key=ref.key, **fields)
@@ -127,6 +194,43 @@ class ApplicationEngine(core.ApprovalEngine):
             approved_by_own=self._approved_by_own(approvals),
         )
 
+    def _preload_approvals(self, ref: core.MRRef) -> None:
+        if not getattr(self.glab, "supports_parallel_approval_prefetch", False):
+            return
+        with self._approval_prefetch_lock:
+            if self._closed or ref.key in self._approval_prefetch:
+                return
+        try:
+            future = self._approval_prefetch_pool.submit(self.glab.approvals, ref, False)
+        except RuntimeError:
+            return
+        with self._approval_prefetch_lock:
+            if self._closed:
+                future.cancel()
+                return
+            self._approval_prefetch[ref.key] = future
+
+    def _load_preflight_approvals(self, ref: core.MRRef, use_leader: bool) -> core.ApprovalInfo:
+        with self._approval_prefetch_lock:
+            future = self._approval_prefetch.pop(ref.key, None)
+        if future is not None:
+            if use_leader:
+                future.cancel()
+            else:
+                try:
+                    return future.result()
+                except core.ProcessingStopped:
+                    raise
+                except Exception as error:
+                    self.console.debug(f"{ref.key} 并行审批状态读取失败，改为重新读取：{error!r}")
+        return self.glab.approvals(ref, use_leader)
+
+    def _discard_preloaded_approvals(self, ref: core.MRRef) -> None:
+        with self._approval_prefetch_lock:
+            future = self._approval_prefetch.pop(ref.key, None)
+        if future is not None:
+            future.cancel()
+
     def _on_merge_confirmed(self, details: core.MRDetails) -> None:
         super()._on_merge_confirmed(details)
         self._mark_merged(details.ref)
@@ -136,7 +240,8 @@ class ApplicationEngine(core.ApprovalEngine):
         self._set_stage(plan.ref, "approval")
         self._mr(plan.ref, status="approving", stage="approval")
         result = super()._approve_and_verify(plan)
-        self._mark_approved(plan.ref)
+        if result.actor_wrote:
+            self._mark_approved(plan.ref)
         self._mr(plan.ref, approved=True, actor=plan.actor.name)
         self._publish_approvals(plan.ref, result, True)
         return result
@@ -164,24 +269,32 @@ class ApplicationEngine(core.ApprovalEngine):
             self.console.local.task_id = task_id
             self.console.local.mr_key = ref.key
             try:
-                self.glab.commit_count(ref)
-            except core.AutomationError as error:
-                self.console.warning(f"{ref.key} 无法读取提交数，不影响审批结果：{error}")
-                self.console.debug(error.detail)
-                return
-            if isinstance(counts, dict):
-                self.events.send(
-                    "mr",
-                    task_id=task_id,
-                    key=ref.key,
-                    commit_count=counts.get(ref.key),
-                )
+                try:
+                    self.glab.commit_count(ref)
+                except core.AutomationError as error:
+                    self.console.warning(f"{ref.key} 无法读取提交数，不影响审批结果：{error}")
+                    self.console.debug(error.detail)
+                    return
+                if isinstance(counts, dict):
+                    self.events.send(
+                        "mr",
+                        task_id=task_id,
+                        key=ref.key,
+                        commit_count=counts.get(ref.key),
+                    )
+            finally:
+                with self._metadata_lock:
+                    self._metadata_pending.discard(ref.key)
 
-        threading.Thread(
-            target=load,
-            name="commit-count",
-            daemon=True,
-        ).start()
+        with self._metadata_lock:
+            if ref.key in self._metadata_pending or self._closed:
+                return
+            self._metadata_pending.add(ref.key)
+        try:
+            self._metadata_pool.submit(load)
+        except RuntimeError:
+            with self._metadata_lock:
+                self._metadata_pending.discard(ref.key)
 
     def _process_one(self, ref: core.MRRef, index: int, total: int):
         started = time.monotonic()
@@ -193,6 +306,7 @@ class ApplicationEngine(core.ApprovalEngine):
         try:
             self._wait_until_unlocked("处理 MR")
             result = super()._process_one(ref, index, total)
+            result.stage = self._stage_for(ref)
             # Commit count is display-only metadata. Fill it in after all
             # approval/merge writes, without delaying the completed state.
             if result.merged_count:
@@ -227,14 +341,69 @@ class ApplicationEngine(core.ApprovalEngine):
                 approved_count=1 if approved else 0,
                 merged_count=1 if merged else 0,
                 error=message,
+                stage=stage,
             )
         finally:
+            self._discard_preloaded_approvals(ref)
             with self._active_lock:
                 self.active_mrs -= 1
             self.progress()
             self._clear_state(ref)
 
+    def _publish_progress(
+        self,
+        task: core.MessageTask,
+        results: Mapping[int, core.MRResult],
+        total: int,
+        started: float,
+    ) -> None:
+        """Show completed MRs immediately while the rest of the message runs."""
+        if len(results) >= total:
+            return
+        rows = [
+            self._mr_result_summary(task.refs[index - 1], results[index])
+            for index in sorted(results)
+        ]
+        approvals = sum(result.approved_count for result in results.values())
+        merges = sum(result.merged_count for result in results.values())
+        owned = sum(
+            result.owned_merge
+            for result in results.values()
+            if result.merged_count
+        )
+        unknown_owner = sum(
+            not result.owned_merge and not result.merge_owner_known
+            for result in results.values()
+            if result.merged_count
+        )
+        other_owner = max(0, merges - owned - unknown_owner)
+        summary = (
+            f"{total} 个 MR：已完成 {len(results)} 个，"
+            f"正在处理 {total - len(results)} 个"
+        )
+        if merges:
+            summary += f"（本机合并 {owned} 个，其他成员合并 {other_owner} 个"
+            if unknown_owner:
+                summary += f"，合并人未知 {unknown_owner} 个"
+            summary += "）"
+        self.events.send(
+            "task_update",
+            id=task.event_key,
+            status="running",
+            approved_count=approvals,
+            merged_count=merges,
+            owned_merge_count=owned,
+            other_merge_count=other_owner,
+            unknown_merge_count=unknown_owner,
+            received=False,
+            elapsed=time.monotonic() - started,
+            summary=summary,
+            mr_summaries=rows,
+            error="",
+        )
+
     def process(self, task: core.MessageTask) -> None:
+        self.apply_settings(self.settings)
         self.task_id = task.event_key
         self.own_user_ids = {self.primary_identity.user_id}
         configured_leader = getattr(self, "configured_leader", None)
@@ -258,24 +427,32 @@ class ApplicationEngine(core.ApprovalEngine):
                 self.console.debug(repr(error))
                 results[1] = core.MRResult(error=message)
         else:
-            with ThreadPoolExecutor(max_workers=min(total, self.settings["max_concurrent_mrs"]), thread_name_prefix="approval-mr") as pool:
-                futures = {pool.submit(self._process_one, ref, i, total): i for i, ref in enumerate(task.refs, 1)}
-                for future in as_completed(futures):
-                    index = futures[future]
-                    try:
-                        results[index] = future.result()
-                    except core.ProcessingStopped:
-                        stopped = True
-                        stopped_count += 1
-                        results[index] = core.MRResult()
-                    except Exception as error:
-                        message = f"任务处理异常：{error}"
-                        self.console.error(message)
-                        self.console.debug(repr(error))
-                        results[index] = core.MRResult(error=message)
+            futures = {
+                self._approval_pool.submit(self._run_limited, ref, i, total): i
+                for i, ref in enumerate(task.refs, 1)
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    results[index] = future.result()
+                except core.ProcessingStopped:
+                    stopped = True
+                    stopped_count += 1
+                    results[index] = core.MRResult()
+                except Exception as error:
+                    message = f"任务处理异常：{error}"
+                    self.console.error(message)
+                    self.console.debug(repr(error))
+                    results[index] = core.MRResult(error=message)
+                self._publish_progress(task, results, total, started)
         approvals = sum(r.approved_count for r in results.values())
         merges = sum(r.merged_count for r in results.values())
         errors = [r.error for r in results.values() if r.error]
+        mr_summaries = [
+            self._mr_result_summary(task.refs[index - 1], results[index])
+            for index in range(1, total + 1)
+            if index in results
+        ]
         owned = sum(r.owned_merge for r in results.values() if r.merged_count)
         unknown_owner = sum(
             not r.owned_merge and not r.merge_owner_known
@@ -289,17 +466,8 @@ class ApplicationEngine(core.ApprovalEngine):
         should_receive = not stopped and self.settings["send_received"] and receipt_owned > 0 and (
             self.settings["received_condition"] == "any_owned_merge" or not errors
         )
-        if should_receive:
-            self._wait_until_unlocked("添加收到表态")
-            try:
-                self.dws.add_received(task.conversation_id, task.message_id)
-                received = True
-                self.console.success("已给原消息添加收到表态")
-            except core.AutomationError as error:
-                receipt_error = str(error)
-                self.console.error(f"MR 处理已结束，添加收到失败：{error}")
         status = "stopped" if stopped else "completed"
-        if not stopped and (errors or receipt_error):
+        if not stopped and errors:
             status = "partial" if approvals or merges or owned else "failed"
         summary = f"{total} 个 MR：本次本机审批 {approvals} 个，已合并 {merges} 个"
         if merges:
@@ -313,29 +481,100 @@ class ApplicationEngine(core.ApprovalEngine):
             summary += f"，{len(errors)} 个处理失败"
         if stopped:
             summary = f"监听已停止：{summary}"
-        if received:
-            summary += "，已添加收到"
-        self.events.send("task_update", id=task.event_key, status=status,
-                         approved_count=approvals, merged_count=merges,
-                         owned_merge_count=owned, other_merge_count=other_owner,
-                         unknown_merge_count=unknown_owner, received=received,
-                         elapsed=time.monotonic() - started, summary=summary,
-                         error="；".join(errors + ([receipt_error] if receipt_error else [])))
+
+        def emit_task_update() -> None:
+            self.events.send(
+                "task_update",
+                id=task.event_key,
+                status=status,
+                approved_count=approvals,
+                merged_count=merges,
+                owned_merge_count=owned,
+                other_merge_count=other_owner,
+                unknown_merge_count=unknown_owner,
+                received=received,
+                elapsed=time.monotonic() - started,
+                summary=summary,
+                mr_summaries=mr_summaries,
+                error="；".join(errors + ([receipt_error] if receipt_error else [])),
+            )
+
+        # Show the MR result as soon as GitLab is done. The DWS "收到"
+        # reaction is an independent best-effort write and must not make the
+        # approval result look slower than it is.
+        emit_task_update()
+        if should_receive:
+            self._wait_until_unlocked("添加收到表态")
+            try:
+                self.dws.add_received(task.conversation_id, task.message_id)
+                received = True
+                self.console.success("已给原消息添加收到表态")
+            except core.AutomationError as error:
+                receipt_error = str(error)
+                self.console.error(f"MR 处理已结束，添加收到失败：{error}")
+                if status == "completed":
+                    status = "partial" if approvals or merges or owned else "failed"
+            if received:
+                summary += "，已添加收到"
+            elif receipt_error:
+                summary += f"，添加收到失败：{receipt_error}"
+            emit_task_update()
+
         if stopped:
             self.notifier.send("代码审批已停止", summary, task.sender_name, task_id=task.event_key)
         else:
             self.notifier.send("代码审批处理完成" if status == "completed" else "代码审批处理失败" if status == "failed" else "代码审批部分完成", summary, task.sender_name, task_id=task.event_key)
 
+    @staticmethod
+    def _mr_result_summary(ref: core.MRRef, result: core.MRResult) -> str:
+        parts: list[str] = []
+        if result.approvals_known:
+            names = "、".join(result.approvers) or "未返回"
+            ownership = "本机参与" if result.approved_by_own else "其他成员"
+            parts.append(f"审批人 {names}（{ownership}）")
+        else:
+            parts.append("审批人未获取")
+
+        if result.merged_count:
+            if result.merged_by:
+                ownership = (
+                    "本机"
+                    if result.owned_merge
+                    else "其他成员"
+                    if result.merge_owner_known
+                    else "归属未知"
+                )
+                parts.append(f"合并人 {result.merged_by}（{ownership}）")
+            else:
+                parts.append("合并人未返回")
+        elif result.error:
+            stage = {
+                "preflight": "检查",
+                "approval": "审批",
+                "merge": "合并",
+            }.get(result.stage, "处理")
+            parts.append(f"{stage}失败")
+        else:
+            parts.append("未完成")
+        return f"{ref.key}：" + "；".join(parts)
+
 
 class ApplicationRuntime(core.ListenerRuntime):
     def __init__(self, *args: Any, events: Events, settings: Callable[[], dict[str, Any]], **kwargs: Any):
-        super().__init__(*args, **kwargs)
+        snapshot = settings()
+        super().__init__(
+            *args,
+            queue_size=snapshot["queue_capacity"],
+            max_urls=snapshot["max_mrs_per_message"],
+            reconnect_delays=snapshot["reconnect_delays"],
+            **kwargs,
+        )
         self.events = events
         self.settings = settings
-        self.tasks = queue.Queue(maxsize=settings()["queue_capacity"])
         self.enqueued: dict[str, float] = {}
         self.connection = "starting"
         self.active_task_id = ""
+        self._accept_lock = threading.Lock()
         self.engine.progress = self.emit_state
         self.avatars = SenderAvatars(
             lambda contact: lookup_sender_avatar(self.dws, contact),
@@ -352,6 +591,18 @@ class ApplicationRuntime(core.ListenerRuntime):
             return
         self.connection = "listening"
         self.emit_state()
+
+    def apply_settings(self, settings: dict[str, Any] | None = None) -> None:
+        current = dict(self.settings() if settings is None else settings)
+        with self._accept_lock:
+            with self.tasks.mutex:
+                self.tasks.maxsize = current["queue_capacity"]
+        self.max_urls = current["max_mrs_per_message"]
+        self.reconnect_delays = tuple(current["reconnect_delays"])
+        if hasattr(self.engine, "apply_settings"):
+            self.engine.apply_settings(current)
+        else:
+            self.engine.settings = current
 
     def emit_state(self) -> None:
         status = self.connection
@@ -433,33 +684,49 @@ class ApplicationRuntime(core.ListenerRuntime):
         except core.AutomationError as error:
             self._task_record(event, key, sender, status="invalid", summary="消息无法处理", error=str(error))
             return
-        if not self._reserve(refs):
-            self._task_record(event, key, sender, refs, status="discarded", summary="包含已在队列或正在处理的 MR")
-            return
-        if not self.recent_messages.add_if_new(key):
-            self._release(refs)
-            return
         task = core.MessageTask(key, str(event["message_id"]), str(event["conversation_id"]), sender, refs)
-        self._task_record(event, key, sender, refs, quoted=used_quote,
-                          summary="等待手动恢复" if reason == "paused" else "等待解锁" if reason == "locked" else "等待处理")
-        self.enqueued[key] = time.monotonic()
-        try:
-            self.tasks.put_nowait(task)
-        except queue.Full:
-            if settings["queue_overflow_policy"] == "drop_oldest":
-                try:
-                    old = self.tasks.get_nowait()
-                    if old is not None:
-                        self._discard(old, "队列已满，按设置移除了最早的待处理消息")
-                    self.tasks.task_done()
-                except queue.Empty:
-                    pass
-                try:
-                    self.tasks.put_nowait(task)
-                except queue.Full:
-                    self._discard(task, "队列已满，未加入队列")
-            else:
-                self._discard(task, "队列已满，按设置丢弃了新消息")
+        with self._accept_lock:
+            if self.recent_messages.contains(key):
+                self.console.debug("忽略当前进程内重复投递的消息")
+                return
+            if not self._reserve(refs):
+                self._task_record(event, key, sender, refs, status="discarded",
+                                  summary="包含已在队列或正在处理的 MR")
+                return
+            # A message is only considered accepted after it is actually in
+            # the queue. Pause/lock discards and failed queue writes must stay
+            # retryable by the source instead of poisoning the dedup cache.
+            self._task_record(
+                event,
+                key,
+                sender,
+                refs,
+                quoted=used_quote,
+                summary="等待手动恢复" if reason == "paused" else "等待解锁" if reason == "locked" else "等待处理",
+            )
+            try:
+                self.tasks.put_nowait(task)
+            except queue.Full:
+                if settings["queue_overflow_policy"] == "drop_oldest":
+                    try:
+                        old = self.tasks.get_nowait()
+                        if old is not None:
+                            self._discard(old, "队列已满，按设置移除了最早的待处理消息")
+                        self.tasks.task_done()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self.tasks.put_nowait(task)
+                    except queue.Full:
+                        self._discard(task, "队列已满，未加入队列")
+                        self.emit_state()
+                        return
+                else:
+                    self._discard(task, "队列已满，按设置丢弃了新消息")
+                    self.emit_state()
+                    return
+            self.enqueued[key] = time.monotonic()
+            self.recent_messages.add_if_new(key)
         self.emit_state()
 
     def _discard(self, task: core.MessageTask, reason: str) -> None:
@@ -469,16 +736,17 @@ class ApplicationRuntime(core.ListenerRuntime):
         self.events.send("task_update", id=task.event_key, status="discarded", summary=reason)
 
     def clear_queue(self) -> int:
-        count = 0
-        while True:
-            try:
-                task = self.tasks.get_nowait()
-            except queue.Empty:
-                break
-            if task is not None:
-                self._discard(task, "已手动清空待处理队列")
-                count += 1
-            self.tasks.task_done()
+        with self._accept_lock:
+            count = 0
+            while True:
+                try:
+                    task = self.tasks.get_nowait()
+                except queue.Empty:
+                    break
+                if task is not None:
+                    self._discard(task, "已手动清空待处理队列")
+                    count += 1
+                self.tasks.task_done()
         self.emit_state()
         return count
 
@@ -541,8 +809,7 @@ class ApplicationRuntime(core.ListenerRuntime):
                 if settings["max_queue_age_seconds"] and age >= settings["max_queue_age_seconds"]:
                     self._discard(task, "等待时间超过设置上限，已跳过")
                     continue
-                configure_core(settings)
-                self.engine.settings = settings
+                self.apply_settings(settings)
                 for name in ("commit_counts", "details_cache"):
                     cache = getattr(self.engine.glab, name, None)
                     if isinstance(cache, dict):
@@ -658,6 +925,12 @@ class ApplicationRuntime(core.ListenerRuntime):
                                 self._handle_event(payload)
                         except json.JSONDecodeError:
                             self.console.warning("忽略一条无法识别的钉钉事件")
+                        except Exception as error:
+                            # A malformed or unexpected event must not kill the
+                            # only consumer while the DWS subscription remains
+                            # healthy and the UI still reports "listening".
+                            self.console.error(f"处理钉钉事件异常：{error}")
+                            self.console.debug(repr(error))
 
                 output_thread = threading.Thread(target=read_events, name="dws-events", daemon=True)
                 status_thread.start()
@@ -689,9 +962,18 @@ class ApplicationRuntime(core.ListenerRuntime):
                         returncode = process.wait(timeout=10)
                     except subprocess.TimeoutExpired:
                         self.connection = "stopping"
-                        self.console.warning(f"钉钉连接组件（PID {process.pid}）仍在清理订阅，等待正常退出")
-                        self.emit_state()
-                        returncode = process.wait()
+                        self.console.warning(
+                            f"钉钉连接组件（PID {process.pid}）仍在清理订阅，强制结束"
+                        )
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
+                        try:
+                            returncode = process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            self.console.error("钉钉连接组件未能退出，已放弃等待")
+                            returncode = -1
                     output_thread.join(timeout=2)
                     handler_thread.join(timeout=2)
                     status_thread.join(timeout=2)
@@ -730,7 +1012,11 @@ class ApplicationRuntime(core.ListenerRuntime):
             self.stop_event.set()
             self.clear_queue()
             self.tasks.put(None)
-            worker.join()
+            worker.join(timeout=10)
+            if worker.is_alive():
+                self.console.error("审批工作线程未能及时结束，可能仍有外部命令未响应")
+            if hasattr(self.engine, "close"):
+                self.engine.close()
             try:
                 self._mark_read_tasks.put_nowait(None)
             except queue.Full:

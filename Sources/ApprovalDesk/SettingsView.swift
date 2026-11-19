@@ -184,7 +184,7 @@ struct SettingsView: View {
                 DebouncedTextField(placeholder: "群名称", text: Binding(get: { kind == "approval" ? model.settings.approvalGroup : model.settings.senderGroup }, set: { value in
                     model.updateGroupName(value, kind: kind)
                 }))
-                Button("查找并选择") { model.beginGroupSearch(kind: kind, query: kind == "approval" ? model.settings.approvalGroup : model.settings.senderGroup) }.disabled(model.isBusy)
+                Button("查找并选择") { model.beginGroupSearch(kind: kind) }.disabled(model.isBusy)
             }
             let selected = kind == "approval" ? model.settings.approvalGroupId : model.settings.senderGroupId
             if !selected.isEmpty { Label("已选择具体群聊", systemImage: "checkmark.circle").font(.system(size: 10)).foregroundStyle(Color.brand) }

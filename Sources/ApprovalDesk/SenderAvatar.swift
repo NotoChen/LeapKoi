@@ -5,6 +5,8 @@ import SwiftUI
 @MainActor
 final class AvatarImageCache {
     static let shared = AvatarImageCache()
+    static let allowedHostSuffixes = ["dingtalk.com", "alicdn.com"]
+    static let maximumBytes = 2 * 1024 * 1024
     private let images = NSCache<NSURL, NSImage>()
     private var requests: [URL: Task<NSImage?, Never>] = [:]
     private let session: URLSession
@@ -15,7 +17,16 @@ final class AvatarImageCache {
         images.totalCostLimit = 16 * 1024 * 1024
     }
 
+    static func isAllowed(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "https",
+              let host = url.host?.lowercased(),
+              url.user == nil, url.password == nil,
+              url.port == nil || url.port == 443 else { return false }
+        return allowedHostSuffixes.contains { host == $0 || host.hasSuffix("." + $0) }
+    }
+
     func image(for url: URL) async -> NSImage? {
+        guard Self.isAllowed(url) else { return nil }
         if let image = images.object(forKey: url as NSURL) { return image }
         if let pending = requests[url] { return await pending.value }
         let pending = Task<NSImage?, Never> {
@@ -23,6 +34,8 @@ final class AvatarImageCache {
                 let request = URLRequest(url: url, cachePolicy: .useProtocolCachePolicy, timeoutInterval: 10)
                 let (data, response) = try await session.data(for: request)
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                      data.count <= Self.maximumBytes,
+                      http.expectedContentLength <= Int64(Self.maximumBytes) || http.expectedContentLength < 0,
                       let source = CGImageSourceCreateWithData(data as CFData, nil),
                       let bitmap = CGImageSourceCreateThumbnailAtIndex(source, 0, [
                         kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -64,7 +77,7 @@ struct SenderAvatar: View {
         .overlay(shape.strokeBorder(Color.primary.opacity(scheme == .dark ? 0.1 : 0.07), lineWidth: 0.5))
         .accessibilityHidden(true)
         .task(id: url) {
-            guard let target = URL(string: url), target.scheme == "https" else {
+            guard let target = URL(string: url), AvatarImageCache.isAllowed(target) else {
                 image = nil; loadedURL = url; return
             }
             let result = await AvatarImageCache.shared.image(for: target)

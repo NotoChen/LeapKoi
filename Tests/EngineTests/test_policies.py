@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "Engine"))
 import listener_core as core
-from configuration import DEFAULTS, configure_core, validate
+from configuration import DEFAULTS, validate
 from protocol import Events, EventConsole, EventNotifier
 from runtime import ApplicationEngine, ApplicationRuntime, PolicyGate
 import worker as worker_module
@@ -337,14 +337,18 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_attempts_change_reaches_core_calls(self):
         settings = validate({"max_attempts": 1})
-        configure_core(settings)
         calls = []
         def operation():
             calls.append(1); raise core.AutomationError("失败", retryable=True)
-        try:
-            with self.assertRaises(core.AutomationError): core.retry_operation(operation, console=EventConsole(Events(lambda e: None)), description="测试")
-            self.assertEqual(len(calls), 1)
-        finally: configure_core(DEFAULTS)
+        with self.assertRaises(core.AutomationError):
+            core.retry_operation(
+                operation,
+                console=EventConsole(Events(lambda e: None)),
+                description="测试",
+                attempts=settings["max_attempts"],
+                retry_delays=settings["retry_delays"],
+            )
+        self.assertEqual(len(calls), 1)
 
     def test_configuration_schema_must_match_current(self):
         for version in (0, True, DEFAULTS["schema_version"] + 1):

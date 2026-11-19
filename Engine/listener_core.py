@@ -405,6 +405,21 @@ def classify_command_error(output: str) -> tuple[str, bool]:
     return "命令返回失败", False
 
 
+def known_terminal_command_error(output: str) -> bool:
+    """Return whether a command failure is definitely not worth retrying."""
+    reason, _retryable = classify_command_error(output)
+    return reason in {
+        "认证失败",
+        "权限不足",
+        "请求参数或当前状态不合法",
+        "MR 不存在或当前账号无权访问",
+        "代码版本已经变化",
+        "合并请求存在冲突或当前不可合并",
+        "流水线或检查条件尚未满足",
+        "合并请求已经关闭",
+    }
+
+
 def friendly_command_error(description: str, output: str, returncode: int) -> str:
     reason, _retryable = classify_command_error(output)
     detail = compact_error_detail(output)
@@ -479,6 +494,29 @@ def dws_listener_error_reason(output: str, returncode: int) -> tuple[str, bool, 
     return f"DWS 监听进程异常退出（退出码 {returncode}）", False, False
 
 
+def _terminate_process(process: subprocess.Popen[str]) -> None:
+    """Best-effort termination with a bounded escalation to SIGKILL."""
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=1)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def run_command(
     command: Sequence[str],
     *,
@@ -487,38 +525,64 @@ def run_command(
     env: Mapping[str, str] | None = None,
     timeout: int | None = None,
     retryable_unknown: bool = False,
+    stop_event: threading.Event | None = None,
 ) -> subprocess.CompletedProcess[str]:
     console.debug(f"执行：{command_text(command)}")
+    if stop_event is not None and stop_event.is_set():
+        raise ProcessingStopped(f"监听正在停止，未执行{description}")
+    effective_timeout = float(COMMAND_TIMEOUT_SECONDS if timeout is None else timeout)
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             list(command),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             env=dict(env) if env is not None else None,
-            timeout=COMMAND_TIMEOUT_SECONDS if timeout is None else timeout,
-            check=False,
         )
-    except subprocess.TimeoutExpired as error:
-        raise AutomationError(
-            f"{description}超时：可能是网络或服务端暂时无响应",
-            retryable=True,
-        ) from error
     except OSError as error:
         raise AutomationError(f"{description}无法启动：{error}") from error
 
-    if completed.returncode != 0:
+    deadline = time.monotonic() + effective_timeout
+    stdout = ""
+    stderr = ""
+    try:
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                if stop_event is not None and stop_event.is_set():
+                    _terminate_process(process)
+                    raise ProcessingStopped(f"监听正在停止，已取消{description}")
+                if time.monotonic() >= deadline:
+                    _terminate_process(process)
+                    raise AutomationError(
+                        f"{description}超时：可能是网络或服务端暂时无响应",
+                        retryable=True,
+                    )
+    except subprocess.SubprocessError as error:
+        _terminate_process(process)
+        raise AutomationError(f"{description}执行异常：{error}") from error
+
+    if process.returncode != 0:
         detail = "\n".join(
-            part for part in ((completed.stderr or "").strip(), (completed.stdout or "").strip()) if part
+            part for part in ((stderr or "").strip(), (stdout or "").strip()) if part
         )
         _reason, retryable = classify_command_error(detail)
+        if retryable_unknown and not known_terminal_command_error(detail):
+            retryable = True
         raise AutomationError(
-            friendly_command_error(description, detail, completed.returncode),
+            friendly_command_error(description, detail, process.returncode or 1),
             detail,
-            retryable=retryable or retryable_unknown,
+            retryable=retryable,
         )
-    return completed
+    return subprocess.CompletedProcess(
+        list(command),
+        process.returncode,
+        stdout,
+        stderr,
+    )
 
 
 def retry_operation(
@@ -528,15 +592,17 @@ def retry_operation(
     description: str,
     stop_event: threading.Event | None = None,
     attempts: int | None = None,
+    retry_delays: Sequence[int] | None = None,
 ) -> Any:
     attempts = RETRY_ATTEMPTS if attempts is None else attempts
+    delays = tuple(RETRY_DELAYS_SECONDS if retry_delays is None else retry_delays)
     for attempt in range(1, attempts + 1):
         try:
             return action()
         except AutomationError as error:
             if not error.retryable or attempt >= attempts:
                 raise
-            delay = RETRY_DELAYS_SECONDS[min(attempt - 1, len(RETRY_DELAYS_SECONDS) - 1)]
+            delay = delays[min(attempt - 1, len(delays) - 1)]
             console.warning(
                 f"{description}暂时失败（第 {attempt}/{attempts} 次）：{error}；"
                 f"{delay} 秒后重试"
@@ -556,6 +622,9 @@ def run_read_command(
     description: str,
     env: Mapping[str, str] | None = None,
     timeout: int | None = None,
+    stop_event: threading.Event | None = None,
+    attempts: int | None = None,
+    retry_delays: Sequence[int] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return retry_operation(
         lambda: run_command(
@@ -565,9 +634,13 @@ def run_read_command(
             env=env,
             timeout=timeout,
             retryable_unknown=True,
+            stop_event=stop_event,
         ),
         console=console,
         description=description,
+        stop_event=stop_event,
+        attempts=attempts,
+        retry_delays=retry_delays,
     )
 
 
@@ -629,6 +702,7 @@ class ContactCandidate:
     title: str
     nick: str
     flower_name: str
+    avatar_media_id: str = ""
 
     @property
     def description(self) -> str:
@@ -682,6 +756,7 @@ class ApprovalInfo:
     user_has_approved: bool
     user_can_approve: bool
     approved_by: dict[int, str]
+    actor_wrote: bool = False
 
 
 @dataclass
@@ -710,6 +785,7 @@ class MRResult:
     approved_by_own: bool = False
     merged_by: str = ""
     merge_owner_known: bool = False
+    stage: str = ""
 
 
 @dataclass(frozen=True)
@@ -747,6 +823,10 @@ class RecentKeys:
 
 
 def parse_mr_url(raw_url: str, gitlab_host: str = DEFAULT_GITLAB_HOST) -> MRRef:
+    try:
+        trusted_host = normalize_gitlab_hostname(gitlab_host)
+    except ValueError as error:
+        raise AutomationError(f"GitLab 主机名格式不正确：{gitlab_host}") from error
     candidate = raw_url.rstrip(TRAILING_URL_PUNCTUATION)
     parsed = urlsplit(candidate)
     if parsed.scheme.lower() != "https":
@@ -756,7 +836,7 @@ def parse_mr_url(raw_url: str, gitlab_host: str = DEFAULT_GITLAB_HOST) -> MRRef:
     except ValueError as error:
         raise AutomationError(f"GitLab 链接端口格式错误：{candidate}") from error
     if (
-        parsed.hostname != gitlab_host
+        parsed.hostname != trusted_host
         or parsed_port not in (None, 443)
         or parsed.username is not None
         or parsed.password is not None
@@ -783,7 +863,7 @@ def parse_mr_url(raw_url: str, gitlab_host: str = DEFAULT_GITLAB_HOST) -> MRRef:
         # GitLab versions use different browser routes. The original validated
         # link remains usable; API routing and deduplication use project_path/iid.
         url=candidate,
-        gitlab_host=gitlab_host,
+        gitlab_host=trusted_host,
     )
 
 
@@ -868,6 +948,23 @@ def extract_mr_refs_from_message(
     return extract_mr_refs("\n".join(contents), gitlab_host, max_urls), used_quote
 
 
+def normalize_gitlab_hostname(value: str) -> str:
+    """Normalize a DNS hostname and reject values that cannot be a host."""
+    if not isinstance(value, str):
+        raise ValueError("GitLab 地址必须是文本")
+    normalized = value.strip().lower()
+    if not normalized or len(normalized) > 253 or normalized.startswith(".") or normalized.endswith("."):
+        raise ValueError("GitLab 主机名格式不正确")
+    if ".." in normalized:
+        raise ValueError("GitLab 主机名格式不正确")
+    for label in normalized.split("."):
+        if not 1 <= len(label) <= 63:
+            raise ValueError("GitLab 主机名格式不正确")
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label):
+            raise ValueError("GitLab 主机名格式不正确")
+    return normalized
+
+
 def event_key(event: Mapping[str, Any]) -> str:
     value = str(event.get("event_id") or event.get("message_id") or "").strip()
     if not value:
@@ -895,10 +992,24 @@ def event_matches(
 
 
 class GlabClient:
-    def __init__(self, executable: str, console: Console, hostname: str) -> None:
+    def __init__(
+        self,
+        executable: str,
+        console: Console,
+        hostname: str,
+        stop_event: threading.Event | None = None,
+        *,
+        command_timeout: int = COMMAND_TIMEOUT_SECONDS,
+        retry_attempts: int = RETRY_ATTEMPTS,
+        retry_delays: Sequence[int] = RETRY_DELAYS_SECONDS,
+    ) -> None:
         self.executable = executable
         self.console = console
         self.hostname = hostname
+        self.stop_event = stop_event
+        self.command_timeout = command_timeout
+        self.retry_attempts = retry_attempts
+        self.retry_delays = tuple(retry_delays)
         fallback_token = os.environ.get("GITLAB_FALLBACK_TOKEN", "").strip()
         legacy_token = os.environ.get("GITLAB_LEADER_TOKEN", "").strip()
         self.leader_token = fallback_token or legacy_token
@@ -916,6 +1027,8 @@ class GlabClient:
                 command,
                 console=self.console,
                 description="检查 glab 命令能力",
+                timeout=self.command_timeout,
+                stop_event=self.stop_event,
             )
             output = "\n".join(
                 ((completed.stdout or ""), (completed.stderr or ""))
@@ -950,6 +1063,10 @@ class GlabClient:
             console=self.console,
             description=description,
             env=self.environment(use_leader),
+            timeout=self.command_timeout,
+            stop_event=self.stop_event,
+            attempts=self.retry_attempts,
+            retry_delays=self.retry_delays,
         )
         return parse_json_output(completed, description)
 
@@ -968,6 +1085,10 @@ class GlabClient:
         if not isinstance(payload, dict):
             raise AutomationError(f"{ref.key} 详情格式异常")
         author = payload.get("author") if isinstance(payload.get("author"), dict) else {}
+        try:
+            author_id = int(author.get("id") or 0)
+        except (TypeError, ValueError):
+            author_id = 0
         # GitLab renamed merged_by to merge_user. Keep each identity intact
         # and prefer the current field, while supporting older servers.
         merged_by = payload.get("merge_user")
@@ -985,16 +1106,20 @@ class GlabClient:
             or ""
         )
         merged_by_id = merged_by.get("id")
+        try:
+            merged_by_id = int(merged_by_id) if merged_by_id is not None else None
+        except (TypeError, ValueError):
+            merged_by_id = None
         web_url = payload.get("web_url")
         return MRDetails(
             ref=ref,
             title=str(payload.get("title") or ref.key),
             state=str(payload.get("state") or ""),
             sha=sha,
-            author_id=int(author.get("id") or 0),
+            author_id=author_id,
             author_name=str(author.get("name") or author.get("username") or "未知"),
             author_username=str(author.get("username") or ""),
-            merged_by_id=int(merged_by_id) if merged_by_id is not None else None,
+            merged_by_id=merged_by_id,
             merged_by_name=str(merged_by.get("name") or merged_by.get("username") or ""),
             work_in_progress=bool(
                 payload.get("work_in_progress") is True or payload.get("draft") is True
@@ -1037,6 +1162,10 @@ class GlabClient:
             console=self.console,
             description=description,
             env=self.environment(use_leader),
+            timeout=self.command_timeout,
+            stop_event=self.stop_event,
+            attempts=self.retry_attempts,
+            retry_delays=self.retry_delays,
         )
         payload = parse_json_output(completed, description)
         if not isinstance(payload, list):
@@ -1091,7 +1220,9 @@ class GlabClient:
             console=self.console,
             description=f"审批 {ref.key}",
             env=self.environment(use_leader),
+            timeout=self.command_timeout,
             retryable_unknown=True,
+            stop_event=self.stop_event,
         )
 
     def merge(self, ref: MRRef, sha: str, use_leader: bool) -> MRDetails | None:
@@ -1110,7 +1241,9 @@ class GlabClient:
             console=self.console,
             description=f"合并 {ref.key}",
             env=self.environment(use_leader),
+            timeout=self.command_timeout,
             retryable_unknown=True,
+            stop_event=self.stop_event,
         )
         payload = parse_json_output(completed, f"合并 {ref.key}")
         if not isinstance(payload, dict):
@@ -1127,10 +1260,19 @@ class DwsClient:
         executable: str,
         console: Console,
         profile: str | None = None,
+        stop_event: threading.Event | None = None,
+        *,
+        command_timeout: int = COMMAND_TIMEOUT_SECONDS,
+        retry_attempts: int = RETRY_ATTEMPTS,
+        retry_delays: Sequence[int] = RETRY_DELAYS_SECONDS,
     ) -> None:
         self.executable = executable
         self.console = console
         self.profile = profile
+        self.stop_event = stop_event
+        self.command_timeout = command_timeout
+        self.retry_attempts = retry_attempts
+        self.retry_delays = tuple(retry_delays)
 
     def command(self, *arguments: str) -> list[str]:
         command = [self.executable]
@@ -1145,6 +1287,8 @@ class DwsClient:
             self.command("auth", "status", "--format", "json"),
             console=self.console,
             description=description,
+            timeout=self.command_timeout,
+            stop_event=self.stop_event,
         )
         payload = parse_json_output(completed, description)
         if not isinstance(payload, dict):
@@ -1172,7 +1316,10 @@ class DwsClient:
             self.consume_command(dry_run=True),
             console=self.console,
             description="检查钉钉长连接配置",
-            timeout=COMMAND_TIMEOUT_SECONDS,
+            timeout=self.command_timeout,
+            stop_event=self.stop_event,
+            attempts=self.retry_attempts,
+            retry_delays=self.retry_delays,
         )
 
     def recover_stale_event_bus(self) -> tuple[bool, str]:
@@ -1281,7 +1428,8 @@ class DwsClient:
             ),
             console=self.console,
             description=f"查找群聊 {query}",
-            timeout=COMMAND_TIMEOUT_SECONDS,
+            timeout=self.command_timeout,
+            stop_event=self.stop_event,
         )
         payload = parse_json_output(completed, f"查找群聊 {query}")
         if not isinstance(payload, dict) or payload.get("success") is not True:
@@ -1350,7 +1498,8 @@ class DwsClient:
             ),
             console=self.console,
             description="查询当前钉钉用户",
-            timeout=COMMAND_TIMEOUT_SECONDS,
+            timeout=self.command_timeout,
+            stop_event=self.stop_event,
         )
         payload = parse_json_output(completed, "查询当前钉钉用户")
         if not isinstance(payload, dict) or payload.get("success") is not True:
@@ -1408,7 +1557,8 @@ class DwsClient:
                 ),
                 console=self.console,
                 description=f"查询{group_name}群成员",
-                timeout=COMMAND_TIMEOUT_SECONDS,
+                timeout=self.command_timeout,
+                stop_event=self.stop_event,
             )
             payload = parse_json_output(completed, f"查询{group_name}群成员")
             if not isinstance(payload, dict) or payload.get("success") is not True:
@@ -1439,6 +1589,7 @@ class DwsClient:
                     title=str(item.get("memberRoleDesc") or "").strip(),
                     nick=str(item.get("memberNick") or "").strip(),
                     flower_name="",
+                    avatar_media_id=str(item.get("memberAvatarMediaId") or "").strip(),
                 )
             if result.get("hasMore") is not True:
                 break
@@ -1481,7 +1632,8 @@ class DwsClient:
             ),
             console=self.console,
             description=f"按姓名查找 {query}",
-            timeout=COMMAND_TIMEOUT_SECONDS,
+            timeout=self.command_timeout,
+            stop_event=self.stop_event,
         )
         payload = parse_json_output(completed, f"按姓名查找 {query}")
         if not isinstance(payload, dict) or payload.get("success") is not True:
@@ -1524,11 +1676,15 @@ class DwsClient:
                 ),
                 console=self.console,
                 description="标记钉钉消息已读",
-                timeout=COMMAND_TIMEOUT_SECONDS,
+                timeout=self.command_timeout,
                 retryable_unknown=True,
+                stop_event=self.stop_event,
             ),
             console=self.console,
             description="标记钉钉消息已读",
+            stop_event=self.stop_event,
+            attempts=self.retry_attempts,
+            retry_delays=self.retry_delays,
         )
 
     def message_by_id(self, message_id: str) -> dict[str, Any]:
@@ -1544,7 +1700,8 @@ class DwsClient:
             ),
             console=self.console,
             description="查询钉钉消息及引用内容",
-            timeout=COMMAND_TIMEOUT_SECONDS,
+            timeout=self.command_timeout,
+            stop_event=self.stop_event,
         )
         payload = parse_json_output(completed, "查询钉钉消息及引用内容")
         if not isinstance(payload, dict) or payload.get("success") is not True:
@@ -1580,11 +1737,15 @@ class DwsClient:
                 ),
                 console=self.console,
                 description="添加“收到”表态",
-                timeout=COMMAND_TIMEOUT_SECONDS,
+                timeout=self.command_timeout,
                 retryable_unknown=True,
+                stop_event=self.stop_event,
             ),
             console=self.console,
             description="添加“收到”表态",
+            stop_event=self.stop_event,
+            attempts=self.retry_attempts,
+            retry_delays=self.retry_delays,
         )
 
     def status(self) -> Any:
@@ -1599,7 +1760,8 @@ class DwsClient:
             ),
             console=self.console,
             description="查询钉钉监听状态",
-            timeout=COMMAND_TIMEOUT_SECONDS,
+            timeout=self.command_timeout,
+            stop_event=self.stop_event,
         )
         return parse_json_output(completed, "查询钉钉监听状态")
 
@@ -1615,6 +1777,12 @@ class ApprovalEngine:
         notifier: Notifier,
         screen_lock: ScreenLockGuard,
         stop_event: threading.Event,
+        *,
+        max_concurrent_mrs: int = MAX_CONCURRENT_MRS,
+        merge_verify_timeout_seconds: int = MERGE_VERIFY_TIMEOUT_SECONDS,
+        merge_verify_interval_seconds: int = MERGE_VERIFY_INTERVAL_SECONDS,
+        retry_attempts: int = RETRY_ATTEMPTS,
+        retry_delays: Sequence[int] = RETRY_DELAYS_SECONDS,
     ) -> None:
         self.glab = glab
         self.dws = dws
@@ -1624,6 +1792,13 @@ class ApprovalEngine:
         self.notifier = notifier
         self.screen_lock = screen_lock
         self.stop_event = stop_event
+        self.max_concurrent_mrs = max_concurrent_mrs
+        self.merge_verify_timeout_seconds = merge_verify_timeout_seconds
+        self.merge_verify_interval_seconds = merge_verify_interval_seconds
+        self.retry_attempts = retry_attempts
+        self.retry_delays = tuple(retry_delays)
+        self.glab.stop_event = stop_event
+        self.dws.stop_event = stop_event
         self.local_user_ids = {primary_identity.user_id}
         if leader_identity is not None:
             self.local_user_ids.add(leader_identity.user_id)
@@ -1634,6 +1809,12 @@ class ApprovalEngine:
     def _wait_until_unlocked(self, action: str) -> None:
         if not self.screen_lock.wait_until_unlocked(self.stop_event, action):
             raise ProcessingStopped(f"监听正在停止，未继续执行{action}")
+
+    def _preload_approvals(self, ref: MRRef) -> None:
+        """Hook for runtimes that can overlap the first approval lookup."""
+
+    def _load_preflight_approvals(self, ref: MRRef, use_leader: bool) -> ApprovalInfo:
+        return self.glab.approvals(ref, use_leader)
 
     def _third_party_names(self, approvals: ApprovalInfo) -> set[str]:
         return {
@@ -1677,6 +1858,7 @@ class ApprovalEngine:
         )
 
     def _preflight_one(self, ref: MRRef, index: int, total: int) -> MRPlan:
+        self._preload_approvals(ref)
         details = self.glab.details(ref)
         prefix = f"[{index}/{total}] {ref.key}"
         if not details.state:
@@ -1693,9 +1875,20 @@ class ApprovalEngine:
         if details.state == "merged":
             merged_by = details.merged_by_name or "未知人员"
             self.console.warning(f"{prefix} 原本已经由 {merged_by} 合并")
+            use_leader = (
+                details.author_id == self.primary_identity.user_id
+                or (
+                    bool(self.primary_identity.username)
+                    and details.author_username.casefold()
+                    == self.primary_identity.username.casefold()
+                )
+            ) and self.leader_identity is not None
+            actor = self.leader_identity if use_leader else self.primary_identity
             approvals: ApprovalInfo | None = None
             try:
-                approvals = self.glab.approvals(ref, False)
+                approvals = self._load_preflight_approvals(ref, use_leader)
+                if approvals.user_has_approved:
+                    approvals.approved_by.setdefault(actor.user_id, actor.name)
             except AutomationError as error:
                 self.console.warning(f"{prefix} 无法读取审批人，继续展示合并结果：{error}")
                 self.console.debug(error.detail)
@@ -1704,8 +1897,8 @@ class ApprovalEngine:
                 details=details,
                 approvals=approvals,
                 approvals_known=approvals is not None,
-                use_leader=False,
-                actor=self.primary_identity,
+                use_leader=use_leader,
+                actor=actor,
                 needs_approval=False,
                 already_merged=True,
             )
@@ -1720,7 +1913,10 @@ class ApprovalEngine:
         if not details.sha:
             raise AutomationError(f"{prefix} 缺少 HEAD SHA")
 
-        use_leader = details.author_username == self.primary_identity.username
+        use_leader = details.author_id == self.primary_identity.user_id or (
+            bool(self.primary_identity.username)
+            and details.author_username.casefold() == self.primary_identity.username.casefold()
+        )
         if use_leader and self.leader_identity is None:
             raise AutomationError(
                 f"{prefix} 由当前账号创建，未配置可选的备用审批账号，已跳过"
@@ -1728,7 +1924,9 @@ class ApprovalEngine:
         actor = self.leader_identity if use_leader else self.primary_identity
         assert actor is not None
 
-        approvals = self.glab.approvals(ref, use_leader)
+        approvals = self._load_preflight_approvals(ref, use_leader)
+        if approvals.user_has_approved:
+            approvals.approved_by.setdefault(actor.user_id, actor.name)
         third_party = self._third_party_names(approvals)
         actor_has_approved = (
             actor.user_id in approvals.approved_by or approvals.user_has_approved
@@ -1781,6 +1979,7 @@ class ApprovalEngine:
             self._wait_until_unlocked("审批")
             try:
                 self.glab.approve(plan.ref, plan.details.sha, plan.use_leader)
+                approvals.actor_wrote = True
             except AutomationError:
                 approvals = self.glab.approvals(plan.ref, plan.use_leader)
                 plan.third_party_approvers.update(self._third_party_names(approvals))
@@ -1801,21 +2000,23 @@ class ApprovalEngine:
             console=self.console,
             description=f"审批 {plan.ref.key}",
             stop_event=self.stop_event,
+            attempts=self.retry_attempts,
+            retry_delays=self.retry_delays,
         )
 
     def _wait_until_merged(self, plan: MRPlan, initial: MRDetails | None = None) -> MRDetails:
-        deadline = time.monotonic() + MERGE_VERIFY_TIMEOUT_SECONDS
+        deadline = time.monotonic() + self.merge_verify_timeout_seconds
         last_details = initial if initial is not None else self.glab.details(plan.ref)
         while last_details.state != "merged":
             if last_details.state == "closed":
                 raise AutomationError(f"{plan.ref.key} 已关闭而非合并")
             if time.monotonic() >= deadline:
                 raise AutomationError(
-                    f"{plan.ref.key} 在 {MERGE_VERIFY_TIMEOUT_SECONDS} 秒内未确认合并，"
+                    f"{plan.ref.key} 在 {self.merge_verify_timeout_seconds} 秒内未确认合并，"
                     "GitLab 仍显示未合并",
                     retryable=True,
                 )
-            if self.stop_event.wait(MERGE_VERIFY_INTERVAL_SECONDS):
+            if self.stop_event.wait(self.merge_verify_interval_seconds):
                 raise ProcessingStopped(f"监听正在停止，未继续确认{plan.ref.key}的合并状态")
             last_details = self.glab.details(plan.ref)
         return last_details
@@ -1930,6 +2131,8 @@ class ApprovalEngine:
                 console=self.console,
                 description=f"合并 {plan.ref.key}",
                 stop_event=self.stop_event,
+                attempts=self.retry_attempts,
+                retry_delays=self.retry_delays,
             )
         except AutomationError as error:
             # A later read-only retry must not erase the original merge error.
@@ -1972,7 +2175,7 @@ class ApprovalEngine:
                     approvals = self._approve_and_verify(plan)
                     plan.approvals = approvals
                     approvals_known = True
-                    approval_count = 1
+                    approval_count = 1 if approvals.actor_wrote else 0
                     self.console.success(f"{prefix} 审批成功")
                 else:
                     self.console.info(f"{prefix} 当前执行账号已经审批，跳过审批")
@@ -2021,7 +2224,7 @@ class ApprovalEngine:
             try:
                 approvals = self.glab.approvals(ref, plan.use_leader)
                 approvals_known = True
-                if approval_count:
+                if approval_count or approvals.user_has_approved:
                     approvals.approved_by.setdefault(plan.actor.user_id, plan.actor.name)
             except AutomationError as error:
                 self.console.warning(
@@ -2044,12 +2247,29 @@ class ApprovalEngine:
             merge_owner_known=final_details.merged_by_id is not None,
         )
 
+    def _process_one_safely(
+        self,
+        ref: MRRef,
+        index: int,
+        total: int,
+    ) -> MRResult:
+        """Keep an unexpected error from one MR from aborting its siblings."""
+        try:
+            return self._process_one(ref, index, total)
+        except ProcessingStopped:
+            raise
+        except Exception as error:
+            message = f"[{index}/{total}] {ref.key} 处理异常：{error}"
+            self.console.error(message)
+            self.console.debug(repr(error))
+            return MRResult(error=message)
+
     def process(self, task: MessageTask) -> None:
         total = len(task.refs)
         if total == 1:
             self.console.info("开始处理 1 个 MR")
         else:
-            worker_count = min(total, MAX_CONCURRENT_MRS)
+            worker_count = min(total, self.max_concurrent_mrs)
             self.console.info(
                 f"开始按 MR 并发处理，共 {total} 个 MR，最大并发 {worker_count}"
             )
@@ -2062,14 +2282,14 @@ class ApprovalEngine:
 
         results: dict[int, MRResult] = {}
         if total == 1:
-            results[1] = self._process_one(task.refs[0], 1, total)
+            results[1] = self._process_one_safely(task.refs[0], 1, total)
         else:
             with ThreadPoolExecutor(
-                max_workers=min(total, MAX_CONCURRENT_MRS),
+                max_workers=min(total, self.max_concurrent_mrs),
                 thread_name_prefix="mr-approval",
             ) as executor:
                 futures = {
-                    executor.submit(self._process_one, ref, index, total): index
+                    executor.submit(self._process_one_safely, ref, index, total): index
                     for index, ref in enumerate(task.refs, 1)
                 }
                 for future in as_completed(futures):
@@ -2159,6 +2379,11 @@ class ListenerRuntime:
         gitlab_host: str,
         screen_lock: ScreenLockGuard,
         stop_event: threading.Event,
+        *,
+        queue_size: int = QUEUE_SIZE,
+        max_urls: int = MAX_URLS,
+        reconnect_delays: Sequence[int] = RECONNECT_DELAYS,
+        recent_message_limit: int = RECENT_MESSAGE_LIMIT,
     ) -> None:
         self.dws = dws
         self.engine = engine
@@ -2170,8 +2395,13 @@ class ListenerRuntime:
         self.gitlab_host = gitlab_host
         self.screen_lock = screen_lock
         self.stop_event = stop_event
-        self.tasks: queue.Queue[MessageTask | None] = queue.Queue(maxsize=QUEUE_SIZE)
-        self.recent_messages = RecentKeys(RECENT_MESSAGE_LIMIT)
+        self.max_urls = max_urls
+        self.reconnect_delays = tuple(reconnect_delays)
+        self.dws.stop_event = stop_event
+        if hasattr(self.engine, "glab"):
+            self.engine.glab.stop_event = stop_event
+        self.tasks: queue.Queue[MessageTask | None] = queue.Queue(maxsize=queue_size)
+        self.recent_messages = RecentKeys(recent_message_limit)
         self._reservation_lock = threading.Lock()
         self._reserved_mrs: set[str] = set()
         self._process_lock = threading.Lock()
@@ -2248,25 +2478,26 @@ class ListenerRuntime:
 
         direct_refs: tuple[MRRef, ...] | None = None
         try:
-            direct_refs = extract_mr_refs(content, self.gitlab_host)
+            direct_refs = extract_mr_refs(content, self.gitlab_host, self.max_urls)
         except AutomationError:
             pass
 
         message_detail: Mapping[str, Any] | None = None
         detail_error: AutomationError | None = None
-        try:
-            message_detail = self.dws.message_by_id(message_id)
-        except AutomationError as error:
-            detail_error = error
-            if direct_refs is None:
+        if direct_refs is None:
+            try:
+                message_detail = self.dws.message_by_id(message_id)
+            except AutomationError as error:
+                detail_error = error
                 self.console.warning("无法读取当前消息的引用内容，将继续按消息正文判断")
-            self.console.debug(error.detail or str(error))
+                self.console.debug(error.detail or str(error))
 
         try:
             refs, used_quote = extract_mr_refs_from_message(
                 content,
                 message_detail,
                 self.gitlab_host,
+                self.max_urls,
             )
         except AutomationError as error:
             if detail_error is not None:
@@ -2297,9 +2528,6 @@ class ListenerRuntime:
                 subtitle=f"发送人：{sender_name}",
             )
             return
-        if not self.recent_messages.add_if_new(key):
-            self._release(refs)
-            return
 
         task = MessageTask(
             event_key=key,
@@ -2320,6 +2548,7 @@ class ListenerRuntime:
                 subtitle=f"发送人：{sender_name}",
             )
             return
+        self.recent_messages.add_if_new(key)
         waiting = self.tasks.qsize()
         if locked_at_receive:
             self.console.warning("电脑当前已锁屏，本条审批消息已暂存，解锁后继续处理")
@@ -2517,7 +2746,7 @@ class ListenerRuntime:
                 else:
                     returncode = 1
 
-                delay = RECONNECT_DELAYS[min(reconnect_index, len(RECONNECT_DELAYS) - 1)]
+                delay = self.reconnect_delays[min(reconnect_index, len(self.reconnect_delays) - 1)]
                 reconnect_index += 1
                 self.console.info(f"{delay} 秒后重新连接钉钉")
                 if self.stop_event.wait(delay):
@@ -2535,7 +2764,9 @@ class ListenerRuntime:
             if self._worker_active.is_set() or not self.tasks.empty():
                 self.console.info("等待当前审批操作安全结束")
             self.tasks.put(None)
-            worker.join()
+            worker.join(timeout=10)
+            if worker.is_alive():
+                self.console.error("审批工作线程未能及时结束，可能仍有外部命令未响应")
             self.console.success("代码审批监听已停止")
         return 0
 
@@ -3050,13 +3281,10 @@ def nonempty_argument(value: str) -> str:
 
 
 def gitlab_hostname_argument(value: str) -> str:
-    normalized = value.strip().lower()
-    if (
-        not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", normalized)
-        or ".." in normalized
-    ):
+    try:
+        return normalize_gitlab_hostname(value)
+    except ValueError as error:
         raise argparse.ArgumentTypeError("GitLab 主机名格式不正确")
-    return normalized
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:

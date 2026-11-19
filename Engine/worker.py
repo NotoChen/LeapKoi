@@ -17,18 +17,25 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import listener_core as core
-from configuration import DEFAULTS, configure_core, executable, validate
+from configuration import DEFAULTS, executable, validate
+from gitlab_http import GitLabHTTPClient
 from protocol import Events, EventConsole, EventNotifier
 from runtime import ApplicationEngine, ApplicationRuntime, PolicyGate
 from version import application_version
 
 
-class AppGlab(core.GlabClient):
+class AppGlab(GitLabHTTPClient):
     def __init__(self, path, console, settings):
-        super().__init__(path, console, settings["gitlab_host"])
-        self.primary_token = settings["gitlab_token"].strip()
-        self.leader_token = settings["fallback_token"].strip()
-        self.uses_legacy_fallback_token = False
+        super().__init__(
+            path,
+            console,
+            settings["gitlab_host"],
+            primary_token=settings["gitlab_token"],
+            fallback_token=settings["fallback_token"],
+            command_timeout=settings["command_timeout_seconds"],
+            retry_attempts=settings["max_attempts"],
+            retry_delays=settings["retry_delays"],
+        )
         self.commit_counts: dict[str, int] = {}
         self.details_cache = {}
 
@@ -57,7 +64,14 @@ class AppGlab(core.GlabClient):
 
 class AppDws(core.DwsClient):
     def __init__(self, path, console, settings):
-        super().__init__(path, console, settings["profile"] or None)
+        super().__init__(
+            path,
+            console,
+            settings["profile"] or None,
+            command_timeout=settings["command_timeout_seconds"],
+            retry_attempts=settings["max_attempts"],
+            retry_delays=settings["retry_delays"],
+        )
         self.settings = settings
         self.gate = None
         self.stop_event = None
@@ -67,8 +81,11 @@ class AppDws(core.DwsClient):
             if self.gate and not self.gate.wait_until_unlocked(self.stop_event, description):
                 raise core.ProcessingStopped("监听正在停止")
             return core.run_command(self.command(*arguments), console=self.console, description=description,
-                                    retryable_unknown=True)
-        core.retry_operation(operation, console=self.console, description=description, stop_event=self.stop_event)
+                                    timeout=self.command_timeout, retryable_unknown=True,
+                                    stop_event=self.stop_event)
+        core.retry_operation(operation, console=self.console, description=description,
+                             stop_event=self.stop_event, attempts=self.retry_attempts,
+                             retry_delays=self.retry_delays)
 
     def mark_read(self, conversation_id, message_id):
         self._write(["chat", "mark-read", "--conversation-id", conversation_id, "--message-id", message_id,
@@ -129,7 +146,6 @@ class Controller:
         if self.runtime:
             raise core.AutomationError("请先停止监听，再重新读取账号")
         settings = dict(self.settings)
-        configure_core(settings)
         self.console.debug_enabled = settings["debug_output"]
 
         def read(service):
@@ -165,7 +181,6 @@ class Controller:
 
     def environment(self, settings=None):
         settings = dict(self.settings) if settings is None else settings
-        configure_core(settings)
         self.console.debug_enabled = settings["debug_output"]
         dws_path = executable("dws", settings)
         glab_path = executable("glab", settings)
@@ -245,6 +260,7 @@ class Controller:
             stop = threading.Event()
             dws.gate = gate
             dws.stop_event = stop
+            glab.stop_event = stop
             engine = ApplicationEngine(glab, dws, identity, leader, self.console, notifier, gate, stop,
                                        settings=dict(settings), events=self.events)
             engine.configured_leader = leader
@@ -347,8 +363,7 @@ class Controller:
             self.settings = validate(message["settings"])
         if command in ("configure", "update_settings"):
             if self.runtime:
-                with self.runtime.tasks.mutex:
-                    self.runtime.tasks.maxsize = self.settings["queue_capacity"]
+                self.runtime.apply_settings(self.settings)
                 self.console.debug_enabled = self.settings["debug_output"]
                 self.runtime.emit_state()
             self.events.send("configured")

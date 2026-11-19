@@ -19,7 +19,6 @@ class AccountTests(unittest.TestCase):
         self.output = []
         self.controller = Controller(Events(self.output.append))
         self.resolve = self.stack.enter_context(patch("worker.executable", side_effect=lambda name, _: f"/fixture/{name}"))
-        self.stack.enter_context(patch("worker.configure_core"))
         self.dws = self.stack.enter_context(patch("worker.AppDws")).return_value
         self.glab = self.stack.enter_context(patch("worker.AppGlab")).return_value
         self.dws.auth_status.return_value = {

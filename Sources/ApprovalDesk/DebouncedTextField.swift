@@ -13,6 +13,7 @@ struct DebouncedTextField: View {
     @State private var draft = ""
     @State private var commitTask: Task<Void, Never>?
     @State private var revealed = false
+    @State private var editID = UUID()
 
     var body: some View {
         HStack(spacing: 6) {
@@ -30,7 +31,10 @@ struct DebouncedTextField: View {
                 .help(revealed ? "隐藏 Token" : "显示 Token")
             }
         }
-            .onAppear { draft = text }
+            .onAppear {
+                draft = text
+                PendingTextEdits.shared.register(id: editID, commit: commit)
+            }
             .onChange(of: text) { _, value in
                 guard value != draft else { return }
                 commitTask?.cancel()
@@ -47,7 +51,10 @@ struct DebouncedTextField: View {
                 }
             }
             .onSubmit(commit)
-            .onDisappear(perform: commit)
+            .onDisappear {
+                PendingTextEdits.shared.unregister(id: editID)
+                commit()
+            }
     }
 
     @ViewBuilder

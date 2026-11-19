@@ -48,7 +48,7 @@ final class AvatarTests: XCTestCase {
         for x in 0..<2 { for y in 0..<2 { bitmap.setColor(color, atX: x, y: y) } }
         let (cache, session) = cache(data: bitmap.representation(using: .png, properties: [:])!)
         defer { session.invalidateAndCancel() }
-        let url = URL(string: "https://avatar.test/person.png")!
+        let url = URL(string: "https://static-legacy.dingtalk.com/person.png")!
         async let list = cache.image(for: url)
         async let detail = cache.image(for: url)
         let (first, second) = await (list, detail)
@@ -62,9 +62,23 @@ final class AvatarTests: XCTestCase {
     func testMissingOrInvalidImageReturnsThePlaceholderState() async throws {
         for code in [200, 404] {
             let (cache, session) = cache(data: Data("not an image".utf8), status: code)
-            let image = await cache.image(for: URL(string: "https://avatar.test/missing.png")!)
+            let image = await cache.image(for: URL(string: "https://static-legacy.dingtalk.com/missing.png")!)
             XCTAssertTrue(image == nil)
             session.invalidateAndCancel()
         }
+    }
+
+    func testAvatarHostAllowlistRejectsUnsafeURLs() {
+        for value in [
+            "http://static-legacy.dingtalk.com/avatar.jpg",
+            "https://static-legacy.dingtalk.com.evil.test/avatar.jpg",
+            "https://evil.test/avatar.jpg",
+            "https://user@static-legacy.dingtalk.com/avatar.jpg",
+            "https://static-legacy.dingtalk.com:8443/avatar.jpg"
+        ] {
+            XCTAssertFalse(AvatarImageCache.isAllowed(URL(string: value)!))
+        }
+        XCTAssertTrue(AvatarImageCache.isAllowed(URL(string: "https://static-legacy.dingtalk.com/avatar.jpg")!))
+        XCTAssertTrue(AvatarImageCache.isAllowed(URL(string: "https://avatars.alicdn.com/avatar.png")!))
     }
 }

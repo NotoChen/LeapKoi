@@ -11,6 +11,7 @@ func XCTAssertEqual<T: Equatable>(_ actual: T, _ expected: T, file: StaticString
 func XCTAssertTrue(_ value: Bool, file: StaticString = #file, line: UInt = #line) { precondition(value, file: file, line: line) }
 func XCTAssertFalse(_ value: Bool, file: StaticString = #file, line: UInt = #line) { precondition(!value, file: file, line: line) }
 func XCTAssertNotNil<T>(_ value: T?, file: StaticString = #file, line: UInt = #line) { precondition(value != nil, file: file, line: line) }
+func XCTAssertNil<T>(_ value: T?, file: StaticString = #file, line: UInt = #line) { precondition(value == nil, file: file, line: line) }
 #endif
 
 final class SettingsTests: XCTestCase {
@@ -74,6 +75,20 @@ final class SettingsTests: XCTestCase {
         }
     }
 
+    func testGitlabHostIsNormalizedAndStrictlyValidated() throws {
+        XCTAssertEqual(AppSettings.normalizedGitlabHost("  Git2.SuperBoss.CC  "), "git2.superboss.cc")
+        for invalid in ["", ".example.com", "example.com.", "a..b", "https://example.com",
+                        "example.com/path", "-example.com", "example-.com", "exa mple.com"] {
+            XCTAssertNil(AppSettings.normalizedGitlabHost(invalid))
+        }
+        var settings = AppSettings()
+        settings.gitlabHost = " Git2.SuperBoss.CC "
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathComponent("settings.json")
+        defer { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
+        try settings.save(to: file)
+        XCTAssertEqual(try AppSettings.load(from: file).gitlabHost, "git2.superboss.cc")
+    }
+
     func testTaskSnapshotsAndMRFailureStageSurviveUpdates() {
         var task = ApprovalTask(["id": "task", "sender": "测试",
                                  "conversation_title": "本次监听的群",
@@ -87,11 +102,14 @@ final class SettingsTests: XCTestCase {
 
     func testTaskUpdatesRetainMRDetailsAndPartialSuccess() {
         var task = ApprovalTask(["id": "task", "sender": "测试", "mrs": [["key": "project!1", "url": "https://example.test", "title": "保留标题"]]])
-        task.merge(["status": "partial", "received": true, "merged_count": 1, "error": "另一个 MR 失败"])
+        task.merge(["status": "partial", "received": true, "merged_count": 1,
+                    "mr_summaries": ["project!1：审批人 张三（其他成员）；合并人 李四（本机）"],
+                    "error": "另一个 MR 失败"])
         XCTAssertEqual(task.mrs.first?.title, "保留标题")
         XCTAssertTrue(task.hasErrors)
         XCTAssertTrue(task.received)
         XCTAssertEqual(task.mergedCount, 1)
+        XCTAssertEqual(task.mrSummaries.first, "project!1：审批人 张三（其他成员）；合并人 李四（本机）")
     }
 
     func testMRDetailsUseServerURLAndKeepItThroughProgressUpdates() {
@@ -126,24 +144,24 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(mr.status, "completed")
         XCTAssertEqual(mr.error, "")
         XCTAssertEqual(mr.actor, "当前账号")
-        XCTAssertEqual(mr.mergeSummary, "合并：协作成员 · 其他成员")
+        XCTAssertEqual(mr.mergeSummary, "合并人：协作成员 · 其他成员")
         XCTAssertEqual(mr.ownedMerge, false)
     }
 
     func testConfirmedMergeWithoutMergerKeepsIdentityUnknown() {
         let mr = MRItem(["key": "project!1", "status": "completed", "actor": "当前账号"])
-        XCTAssertEqual(mr.mergeSummary, "合并：GitLab 未返回合并人")
+        XCTAssertEqual(mr.mergeSummary, "合并人：GitLab 未返回")
         XCTAssertEqual(mr.ownedMerge, false)
     }
 
     func testApprovalParticipantsDistinguishLocalAndOtherMembers() {
         var mr = MRItem(["key": "project!1", "status": "completed"])
         mr.merge(["approvers": ["张三", "李四"], "approvals_known": true, "approved_by_own": false])
-        XCTAssertEqual(mr.approvalSummary, "审批：张三、李四 · 均非本机")
+        XCTAssertEqual(mr.approvalSummary, "审批人：张三、李四 · 均为其他成员")
         mr.merge(["approvers": ["张三", "当前账号"], "approved_by_own": true,
                   "merged_by": "当前账号", "merge_owner_known": true, "owned_merge": true])
-        XCTAssertEqual(mr.approvalSummary, "审批：张三、当前账号 · 含本机")
-        XCTAssertEqual(mr.mergeSummary, "合并：当前账号 · 本机")
+        XCTAssertEqual(mr.approvalSummary, "审批人：张三、当前账号 · 本机参与")
+        XCTAssertEqual(mr.mergeSummary, "合并人：当前账号 · 本机")
     }
 
     func testApprovalAndMergeIdentityUnknownStatesAreExplicit() {
@@ -154,7 +172,7 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(knownEmpty.approvalSummary, "审批：GitLab 未返回审批人")
         var namedWithoutOwner = MRItem(["key": "project!1"])
         namedWithoutOwner.merge(["merged_by": "同事"])
-        XCTAssertEqual(namedWithoutOwner.mergeSummary, "合并：同事 · 归属未知")
+        XCTAssertEqual(namedWithoutOwner.mergeSummary, "合并人：同事 · 归属未知")
     }
 
     func testTaskUpdateKeepsSeparateMergeCounts() {
@@ -177,6 +195,7 @@ final class SettingsTests: XCTestCase {
         try tests.testPartialConfigurationGetsDefaults()
         tests.testInvalidCapacityIsRejectedBeforeSaving()
         try tests.testConfigurationSchemaMustMatchTheApplication()
+        try tests.testGitlabHostIsNormalizedAndStrictlyValidated()
         tests.testTaskSnapshotsAndMRFailureStageSurviveUpdates()
         tests.testTaskUpdatesRetainMRDetailsAndPartialSuccess()
         tests.testMRDetailsUseServerURLAndKeepItThroughProgressUpdates()
@@ -186,10 +205,11 @@ final class SettingsTests: XCTestCase {
         tests.testApprovalParticipantsDistinguishLocalAndOtherMembers()
         tests.testApprovalAndMergeIdentityUnknownStatesAreExplicit()
         tests.testTaskUpdateKeepsSeparateMergeCounts()
-        print("13 native model checks passed")
+        print("14 native model checks passed")
         try await AvatarTests().testListAndDetailShareTheDownloadedImage()
         try await AvatarTests().testMissingOrInvalidImageReturnsThePlaceholderState()
-        print("2 native avatar loading checks passed")
+        AvatarTests().testAvatarHostAllowlistRejectsUnsafeURLs()
+        print("3 native avatar loading checks passed")
         let app = AppModelTests()
         try app.testStartupReadsAccountsWithoutStartingListener()
         try app.testOneAccountFailureKeepsOtherIdentityAndErrorDetail()
@@ -210,13 +230,18 @@ final class SettingsTests: XCTestCase {
         try await app.testPendingLoginApprovalIsShownAsPending()
         try await app.testUnexpectedWorkerExitRestartsEngineWithoutStartingListener()
         try await app.testManualStopDoesNotRestartAnExitedWorker()
+        try await app.testStopDuringStartupDoesNotRestartAnExitedWorker()
+        try await app.testWorkerExitAfterListeningStoppedDoesNotRestart()
         try await app.testWorkerRestartResumesAnActiveListener()
         try await app.testWorkerRestartPreservesPendingCheckWithoutStartingListener()
         try await app.testListeningStateCancelsStartupTimeout()
         try await app.testWorkerRestartStopsAfterBoundedAttempts()
+        try await app.testShortLivedWorkerDoesNotResetRestartBudget()
+        try await app.testStableWorkerResetsRestartBudget()
         try app.testRejectedGroupSendDoesNotLeaveTheModelBusy()
+        try app.testPendingTextEditIsFlushedBeforeGroupSearch()
         try app.testCompletedCountIncludesPartialTasks()
-        print("25 native startup, login-item and account checks passed")
+        print("30 native startup, login-item and account checks passed")
         try app.testBothGroupSelectorsDisplayCandidatesAndSaveTheSelectedGroup()
         try app.testFailedGroupSearchCanBeRetriedAndAnEmptyResultEndsLoading()
         try app.testGroupSelectionWhileActiveSavesForNextStartAndKeepsTasks()

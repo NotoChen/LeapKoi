@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -29,10 +30,26 @@ def copy_executable(source, target):
 
 
 def sdk_path():
+    override = os.environ.get("APPROVALDESK_SDK", "").strip()
+    if override:
+        selected = Path(override).expanduser()
+        if not selected.is_dir():
+            raise RuntimeError(f"APPROVALDESK_SDK 不是有效目录：{selected}")
+        return str(selected)
     selected = subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
-    fallback = Path("/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk")
-    if "/CommandLineTools/" in selected and fallback.is_dir():
-        return str(fallback)
+    if "/CommandLineTools/" not in selected:
+        return selected
+    folder = Path("/Library/Developer/CommandLineTools/SDKs")
+    stable = folder / "MacOSX26.5.sdk"
+    if stable.is_dir():
+        return str(stable)
+    candidates = []
+    for path in folder.glob("MacOSX*.sdk"):
+        match = re.fullmatch(r"MacOSX(\d+(?:\.\d+)*)\.sdk", path.name)
+        if match and path.is_dir():
+            candidates.append((tuple(int(part) for part in match.group(1).split(".")), path))
+    if candidates:
+        return str(max(candidates, key=lambda item: item[0])[1])
     return selected
 
 

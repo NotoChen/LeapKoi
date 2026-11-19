@@ -65,12 +65,14 @@ final class AppModel: ObservableObject {
     private var accountRefreshTask: Task<Void, Never>?
     private var operationTimeoutTask: Task<Void, Never>?
     private var workerRestartTask: Task<Void, Never>?
+    private var workerHealthTask: Task<Void, Never>?
     private var workerRestartAttempt = 0
     private var workerExitHandled = false
     private var resumeAfterWorkerRestart = false
     private var stopRequested = false
     var workerRestartDelays: [TimeInterval] = [1, 2, 5, 10, 30]
     var maxWorkerRestartAttempts = 5
+    var workerStableSeconds: TimeInterval = 8
     var startupTimeoutOverride: TimeInterval?
 
     init(configURL: URL? = nil, demo: Bool? = nil, client: EngineConnection? = nil, loginItem: LoginItemManaging? = nil) {
@@ -129,6 +131,7 @@ final class AppModel: ObservableObject {
         guard !client.isRunning else { return }
         if !restart {
             workerRestartTask?.cancel(); workerRestartTask = nil
+            workerHealthTask?.cancel(); workerHealthTask = nil
             workerRestartAttempt = 0
             stopRequested = false
         }
@@ -237,14 +240,33 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func scheduleWorkerHealthReset() {
+        workerHealthTask?.cancel()
+        let seconds = max(0, workerStableSeconds)
+        workerHealthTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled, self.engineAvailable,
+                  self.client.isRunning, !self.quitting else { return }
+            self.workerRestartAttempt = 0
+            self.workerHealthTask = nil
+        }
+    }
+
     private func handleWorkerExit() {
         guard !quitting else { return }
         guard !workerExitHandled else { return }
         workerExitHandled = true
+        workerHealthTask?.cancel(); workerHealthTask = nil
         accountRefreshTask?.cancel(); accountRefreshTask = nil
         let pendingIntent = pendingAfterLaunch
-        let shouldResume = resumeAfterWorkerRestart || isActive || status == "starting" ||
+        let shouldResume = !stopRequested && (
+            resumeAfterWorkerRestart || isActive || status == "starting" ||
             ["start", "auto_start"].contains(pendingIntent ?? "")
+        )
         let intentionalStop = stopRequested && !shouldResume
         resumeAfterWorkerRestart = shouldResume
         engineAvailable = false
@@ -278,7 +300,9 @@ final class AppModel: ObservableObject {
 
     func refreshAccounts() {
         guard !isDemo else { return }
+        commitPendingSettings()
         workerRestartTask?.cancel(); workerRestartTask = nil
+        workerHealthTask?.cancel(); workerHealthTask = nil
         workerRestartAttempt = 0
         stopRequested = false
         if !isActive, !isBusy { errorMessage = nil; if status == "error" { status = "idle" } }
@@ -372,15 +396,24 @@ final class AppModel: ObservableObject {
         } catch { configurationIssue = "配置保存失败：\(error.localizedDescription)" }
     }
 
+    /// Flush text fields before an action reads the settings snapshot. The
+    /// debounce is useful while typing, but an explicit action must not lose
+    /// the last few characters.
+    func commitPendingSettings() {
+        PendingTextEdits.shared.commitAll()
+    }
+
     func applyAppearance() {
         NSApp?.appearance = settings.appearance == "dark" ? NSAppearance(named: .darkAqua) : settings.appearance == "light" ? NSAppearance(named: .aqua) : nil
     }
 
     func start() {
+        commitPendingSettings()
         guard settings.validationIssue == nil, !isBusy, !isActive else { return }
         errorMessage = nil
         resumeAfterWorkerRestart = true
         stopRequested = false
+        workerHealthTask?.cancel(); workerHealthTask = nil
         workerRestartAttempt = 0
         if isDemo {
             listeningConfiguration = demoListeningConfiguration
@@ -402,6 +435,7 @@ final class AppModel: ObservableObject {
     }
 
     func checkEnvironment() {
+        commitPendingSettings()
         guard !isBusy, !isActive else { return }
         errorMessage = nil
         checks = []
@@ -438,6 +472,7 @@ final class AppModel: ObservableObject {
         resumeAfterWorkerRestart = false
         stopRequested = true
         workerRestartTask?.cancel(); workerRestartTask = nil
+        workerHealthTask?.cancel(); workerHealthTask = nil
         operationTimeoutTask?.cancel(); operationTimeoutTask = nil
         guard client.isRunning else {
             status = "stopped"; connected = false; paused = false
@@ -460,10 +495,12 @@ final class AppModel: ObservableObject {
         if !tasks.contains(where: { $0.id == selectedTaskId }) { selectedTaskId = tasks.first?.id }
     }
 
-    func beginGroupSearch(kind: String, query: String) {
+    func beginGroupSearch(kind: String, query: String? = nil) {
+        commitPendingSettings()
         guard !isBusy, !quitting else { return }
         errorMessage = nil
         groupSearchKind = kind
+        let query = query ?? (kind == "approval" ? settings.approvalGroup : settings.senderGroup)
         let id = UUID().uuidString
         groupRequest = (id, kind, settings.profile)
         groupOptions = []
@@ -520,6 +557,7 @@ final class AppModel: ObservableObject {
 
     func loadProfiles() {
         if isDemo { profileOptions = [ProfileOption(id: "demo", name: "演示账号", organization: "工作空间")]; return }
+        commitPendingSettings()
         guard !isActive, !loadingProfiles else { return }
         pendingProfiles = true
         if !client.isRunning { launchWorker() }
@@ -553,6 +591,7 @@ final class AppModel: ObservableObject {
     }
 
     func login(_ service: String) {
+        commitPendingSettings()
         guard !isBusy, !isActive else { return }
         authService = service; authText = ""; authStatus = "running"; showAuth = true
         if isDemo { authText = "演示模式不发起真实授权。"; authStatus = "completed"; return }
@@ -597,6 +636,7 @@ final class AppModel: ObservableObject {
         accountRefreshTask?.cancel(); accountRefreshTask = nil
         operationTimeoutTask?.cancel(); operationTimeoutTask = nil
         workerRestartTask?.cancel(); workerRestartTask = nil
+        workerHealthTask?.cancel(); workerHealthTask = nil
         resumeAfterWorkerRestart = false
         pendingAfterLaunch = nil; pendingAccountRefresh = false; pendingProfiles = false
         guard client.isRunning else { completion(); return }
@@ -609,8 +649,8 @@ final class AppModel: ObservableObject {
         case "hello":
             engineAvailable = true
             workerExitHandled = false
-            workerRestartAttempt = 0
             stopRequested = false
+            scheduleWorkerHealthReset()
             if currentOperation == "launch" {
                 currentOperation = nil
                 operationTimeoutTask?.cancel(); operationTimeoutTask = nil
@@ -629,6 +669,11 @@ final class AppModel: ObservableObject {
                 failCurrentOperation("执行引擎未就绪，无法同步配置")
                 return
             }
+            runPendingOperations()
+        case "command_ack":
+            guard let command = event["command"] as? String, currentOperation == command else { return }
+            currentOperation = nil
+            operationTimeoutTask?.cancel(); operationTimeoutTask = nil
             runPendingOperations()
         case "operation_finished":
             let command = event["command"] as? String ?? ""
@@ -671,7 +716,6 @@ final class AppModel: ObservableObject {
                 operationTimeoutTask?.cancel(); operationTimeoutTask = nil
             }
             if status == "stopped" {
-                stopRequested = false
                 resumeAfterWorkerRestart = false
             } else if status == "error" {
                 resumeAfterWorkerRestart = false

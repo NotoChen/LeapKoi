@@ -247,6 +247,25 @@ struct TaskDetailView: View {
                         .font(.system(size: 12)).foregroundStyle(.secondary)
                     if !task.error.isEmpty { Text(task.error).font(.system(size: 12)).foregroundStyle(.red).textSelection(.enabled) }
                 }
+                if !task.mrSummaries.isEmpty {
+                    VStack(alignment: .leading, spacing: 9) {
+                        HStack {
+                            Text("逐个 MR 结果").font(.system(size: 12, weight: .semibold))
+                            Spacer()
+                            Text("按实际账号归属").font(.system(size: 10)).foregroundStyle(.tertiary)
+                        }
+                        ForEach(task.mrSummaries.indices, id: \.self) { index in
+                            Text(task.mrSummaries[index])
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentSurface()
+                }
                 VStack(alignment: .leading, spacing: 12) {
                     HStack { Text("合并请求").font(.system(size: 12, weight: .semibold)); Spacer(); Text("按 MR 独立处理").font(.system(size: 10)).foregroundStyle(.tertiary) }
                     ForEach(task.mrs) { mr in MRCard(mr: mr, isDemo: model.isDemo) }

@@ -51,6 +51,18 @@ struct AppSettings: Codable, Equatable {
         result.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         return result
     }
+    static func normalizedGitlabHost(_ raw: String) -> String? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !value.isEmpty, value.count <= 253,
+              !value.hasPrefix("."), !value.hasSuffix("."), !value.contains("..") else { return nil }
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789-")
+        for label in value.split(separator: ".", omittingEmptySubsequences: false) {
+            guard (1...63).contains(label.count),
+                  label.first != "-", label.last != "-",
+                  label.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
+        }
+        return value
+    }
     func dictionary() -> [String: Any] {
         (try? JSONSerialization.jsonObject(with: Self.encoder.encode(self))) as? [String: Any] ?? [:]
     }
@@ -70,6 +82,9 @@ struct AppSettings: Codable, Equatable {
         // The current schema is still v1. Keeping the field and this guard
         // makes future migrations explicit instead of silently accepting them.
         settings.schemaVersion = AppSettings.currentSchemaVersion
+        if let host = AppSettings.normalizedGitlabHost(settings.gitlabHost) {
+            settings.gitlabHost = host
+        }
         if let issue = settings.validationIssue {
             throw NSError(domain: "ApprovalDesk", code: 2, userInfo: [NSLocalizedDescriptionKey: issue])
         }
@@ -80,7 +95,9 @@ struct AppSettings: Codable, Equatable {
             throw NSError(domain: "ApprovalDesk", code: 2, userInfo: [NSLocalizedDescriptionKey: issue])
         }
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Self.encoder.encode(self).write(to: url, options: .atomic)
+        var normalized = self
+        normalized.gitlabHost = Self.normalizedGitlabHost(gitlabHost) ?? gitlabHost
+        try Self.encoder.encode(normalized).write(to: url, options: .atomic)
     }
     var validationIssue: String? {
         if schemaVersion != AppSettings.currentSchemaVersion { return "配置版本与当前应用不一致" }
@@ -92,7 +109,7 @@ struct AppSettings: Codable, Equatable {
         ]
         if options.contains(where: { !$0.1.contains($0.0) }) { return "配置中包含不支持的选项值" }
         if approvalGroup.trimmingCharacters(in: .whitespaces).isEmpty || senderGroup.trimmingCharacters(in: .whitespaces).isEmpty { return "请填写审批群和人员来源群" }
-        if gitlabHost.isEmpty || gitlabHost.contains(":") || gitlabHost.contains("/") || gitlabHost.contains(" ") { return "GitLab 地址只填写主机名，例如 git2.superboss.cc" }
+        if AppSettings.normalizedGitlabHost(gitlabHost) == nil { return "GitLab 地址只填写主机名，例如 git2.superboss.cc" }
         let ranges: [(Int, ClosedRange<Int>, String)] = [
             (queueCapacity, 1...10000, "队列容量"), (maxQueueAgeSeconds, 0...604800, "最长等待时间"),
             (maxConcurrentMrs, 1...16, "并发数量"), (maxMrsPerMessage, 1...200, "单条消息 MR 上限"),
@@ -106,10 +123,12 @@ struct AppSettings: Codable, Equatable {
     }
     var connectionSignature: String {
         // Group selections are compared with the identities resolved by the listener.
-        [profile, gitlabHost, gitlabToken, fallbackToken, dwsPath, glabPath].joined(separator: "\u{1F}")
+        [profile, AppSettings.normalizedGitlabHost(gitlabHost) ?? gitlabHost,
+         gitlabToken, fallbackToken, dwsPath, glabPath].joined(separator: "\u{1F}")
     }
     var accountSignature: String {
-        [profile, gitlabHost, gitlabToken, dwsPath, glabPath].joined(separator: "\u{1F}")
+        [profile, AppSettings.normalizedGitlabHost(gitlabHost) ?? gitlabHost,
+         gitlabToken, dwsPath, glabPath].joined(separator: "\u{1F}")
     }
 }
 
@@ -200,12 +219,12 @@ struct MRItem: Identifiable, Equatable {
         if !approvalsKnown { return "审批：审批人未获取" }
         if approvers.isEmpty { return "审批：GitLab 未返回审批人" }
         let names = approvers.joined(separator: "、")
-        return approvedByOwn ? "审批：\(names) · 含本机" : "审批：\(names) · 均非本机"
+        return approvedByOwn ? "审批人：\(names) · 本机参与" : "审批人：\(names) · 均为其他成员"
     }
     var mergeSummary: String {
-        guard !mergedBy.isEmpty else { return "合并：GitLab 未返回合并人" }
-        guard mergeOwnerKnown else { return "合并：\(mergedBy) · 归属未知" }
-        return ownedMerge ? "合并：\(mergedBy) · 本机" : "合并：\(mergedBy) · 其他成员"
+        guard !mergedBy.isEmpty else { return "合并人：GitLab 未返回" }
+        guard mergeOwnerKnown else { return "合并人：\(mergedBy) · 归属未知" }
+        return ownedMerge ? "合并人：\(mergedBy) · 本机" : "合并人：\(mergedBy) · 其他成员"
     }
 
     init(_ data: [String: Any]) {
@@ -250,6 +269,7 @@ struct ApprovalTask: Identifiable, Equatable {
     var summary = ""
     var error = ""
     var mrs: [MRItem] = []
+    var mrSummaries: [String] = []
     var received = false
     var quoted = false
     var elapsed: Double = 0
@@ -275,6 +295,7 @@ struct ApprovalTask: Identifiable, Equatable {
         if let v = data["conversation_title"] as? String { conversationTitle = v }
         if let v = data["summary"] as? String { summary = v }
         if let v = data["error"] as? String { error = v }
+        if let v = data["mr_summaries"] as? [String] { mrSummaries = v }
         if let v = data["received"] as? Bool { received = v }
         if let v = data["elapsed"] as? Double { elapsed = v }
         if let v = data["approved_count"] as? Int { approvedCount = v }

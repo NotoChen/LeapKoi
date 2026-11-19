@@ -17,6 +17,11 @@ def run(command, **kwargs):
     return subprocess.run([str(item) for item in command], check=True, capture_output=True, text=True, **kwargs)
 
 
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
 def fingerprint(app):
     result = {}
     for path in sorted(app.rglob("*")):
@@ -36,8 +41,9 @@ def check_app(app, architecture, tag=None):
         verify_tag(tag, version)
     resources = app / "Contents/Resources"
     manifest = json.loads((resources / "components.json").read_text())
-    assert manifest["app_version"] == version and manifest["app_build"] == build
-    assert manifest["architecture"] == architecture
+    require(manifest["app_version"] == version and manifest["app_build"] == build,
+            "安装包版本与 Info.plist 不一致")
+    require(manifest["architecture"] == architecture, "安装包架构清单不一致")
     run(["codesign", "--verify", "--deep", "--strict", app])
     for path in app.rglob("*"):
         if path.is_symlink() or not path.is_file():
@@ -57,7 +63,7 @@ def check_app(app, architecture, tag=None):
             env.pop(name, None)
         probe = run([python, "-B", "-c", "import json, ssl, ctypes, fcntl, platform; print(platform.python_version())"],
                     cwd=directory, env=env, timeout=20)
-        assert probe.stdout.strip() == manifest["python"]
+        require(probe.stdout.strip() == manifest["python"], "内置 Python 版本与清单不一致")
         # Resolving the bundled DWS uses the production staging function, so its
         # runtime sidecars must be created outside the signed app.
         component_probe = """import json, subprocess, sys
@@ -72,13 +78,16 @@ print(json.dumps(result))
         versions = json.loads(run([python, "-B", "-c", component_probe, resources / "Engine"],
                                   cwd=directory, env=env, timeout=40).stdout)
         for name, value in versions.items():
-            assert value == manifest["components"][name]["version"], (name, value)
+            require(value == manifest["components"][name]["version"],
+                    f"{name} 组件版本不一致：{value}")
         worker = run([python, "-B", "-u", resources / "Engine/worker.py"],
                      input=json.dumps({"command": "shutdown"}) + "\n", cwd=directory, env=env, timeout=20)
         events = [json.loads(line) for line in worker.stdout.splitlines() if line.strip()]
-        assert any(event.get("type") == "hello" and event.get("version") == version for event in events), events
-        assert not any(event.get("type") == "error" for event in events), events
-    assert fingerprint(app) == before, "运行组件后安装包发生了修改"
+        require(any(event.get("type") == "hello" and event.get("version") == version for event in events),
+                f"执行引擎未正常握手：{events}")
+        require(not any(event.get("type") == "error" for event in events),
+                f"执行引擎启动报错：{events}")
+    require(fingerprint(app) == before, "运行组件后安装包发生了修改")
     run(["codesign", "--verify", "--deep", "--strict", app])
     print(f"安装包验证通过：{app.name} · {version} ({build}) · {architecture}", flush=True)
     return before
@@ -102,15 +111,18 @@ def main():
         root = Path(directory)
         extracted = root / "zip"
         run(["ditto", "-x", "-k", archives / f"{prefix}.zip", extracted])
-        assert check_app(extracted / app.name, args.arch, args.tag) == expected, "ZIP 与原始 App 不一致"
+        require(check_app(extracted / app.name, args.arch, args.tag) == expected,
+                "ZIP 与原始 App 不一致")
         mount = root / "dmg"
         mount.mkdir()
         run(["hdiutil", "attach", "-readonly", "-nobrowse", "-mountpoint", mount, archives / f"{prefix}.dmg"], timeout=45)
         try:
-            assert (mount / "Applications").is_symlink()
-            assert os.readlink(mount / "Applications") == "/Applications"
-            assert (mount / "安装说明.txt").is_file()
-            assert check_app(mount / app.name, args.arch, args.tag) == expected, "DMG 与原始 App 不一致"
+            require((mount / "Applications").is_symlink(), "DMG 缺少 Applications 链接")
+            require(os.readlink(mount / "Applications") == "/Applications",
+                    "DMG 的 Applications 链接目标不正确")
+            require((mount / "安装说明.txt").is_file(), "DMG 缺少安装说明")
+            require(check_app(mount / app.name, args.arch, args.tag) == expected,
+                    "DMG 与原始 App 不一致")
         finally:
             run(["hdiutil", "detach", mount], timeout=20)
     print("ZIP 解压与 DMG 挂载后的应用均通过独立运行检查", flush=True)

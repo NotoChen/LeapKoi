@@ -325,6 +325,38 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(client.launchCount, 1)
     }
 
+    func testStopDuringStartupDoesNotRestartAnExitedWorker() async throws {
+        let (model, client, folder) = try fixture()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        model.workerRestartDelays = [0.01]
+        model.launch(); model.receive(["type": "hello"])
+        ready(model, client); finishAccounts(model, client)
+        model.start()
+        XCTAssertEqual(model.status, "starting")
+        model.stop()
+        client.isRunning = false
+        model.receive(["type": "worker_exit"])
+        XCTAssertEqual(model.status, "stopped")
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(client.launchCount, 1)
+    }
+
+    func testWorkerExitAfterListeningStoppedDoesNotRestart() async throws {
+        let (model, client, folder) = try fixture(autoStart: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        model.workerRestartDelays = [0.01]
+        model.launch(); model.receive(["type": "hello"])
+        ready(model, client); finishAccounts(model, client)
+        model.receive(["type": "state", "status": "listening", "connected": true])
+        model.stop()
+        model.receive(["type": "state", "status": "stopped", "connected": false])
+        client.isRunning = false
+        model.receive(["type": "worker_exit"])
+        XCTAssertEqual(model.status, "stopped")
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(client.launchCount, 1)
+    }
+
     func testWorkerRestartResumesAnActiveListener() async throws {
         let (model, client, folder) = try fixture(autoStart: true)
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -387,6 +419,38 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.errorMessage?.contains("多次启动失败") == true)
     }
 
+    func testShortLivedWorkerDoesNotResetRestartBudget() async throws {
+        let (model, client, folder) = try fixture()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        model.workerRestartDelays = [0.01]
+        model.workerStableSeconds = 1
+        model.maxWorkerRestartAttempts = 2
+        model.launch()
+        for _ in 0..<3 {
+            model.receive(["type": "hello"])
+            client.isRunning = false
+            model.receive(["type": "worker_exit"])
+            try await Task.sleep(for: .milliseconds(30))
+        }
+        XCTAssertEqual(client.launchCount, 3)
+        XCTAssertTrue(model.errorMessage?.contains("多次启动失败") == true)
+    }
+
+    func testStableWorkerResetsRestartBudget() async throws {
+        let (model, client, folder) = try fixture()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        model.workerRestartDelays = [0.01]
+        model.workerStableSeconds = 0.02
+        model.maxWorkerRestartAttempts = 1
+        model.launch()
+        model.receive(["type": "hello"])
+        try await Task.sleep(for: .milliseconds(50))
+        client.isRunning = false
+        model.receive(["type": "worker_exit"])
+        try await waitUntil { client.launchCount == 2 }
+        XCTAssertFalse(model.errorMessage?.contains("多次启动失败") == true)
+    }
+
     func testRejectedGroupSendDoesNotLeaveTheModelBusy() throws {
         let (model, client, folder) = try fixture()
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -398,6 +462,20 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(model.searchingGroups)
         XCTAssertFalse(model.showGroupPicker)
         XCTAssertTrue(model.errorMessage?.contains("无法查找群聊") == true)
+    }
+
+    func testPendingTextEditIsFlushedBeforeGroupSearch() throws {
+        let (model, client, folder) = try fixture()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        model.launch(); model.receive(["type": "hello"])
+        ready(model, client); finishAccounts(model, client)
+        let editID = UUID()
+        PendingTextEdits.shared.register(id: editID) {
+            model.updateGroupName("刚刚输入的群", kind: "approval")
+        }
+        defer { PendingTextEdits.shared.unregister(id: editID) }
+        model.beginGroupSearch(kind: "approval")
+        XCTAssertEqual(client.sent.last?.values["query"] as? String, "刚刚输入的群")
     }
 
     func testCompletedCountIncludesPartialTasks() throws {
