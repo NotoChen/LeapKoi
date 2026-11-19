@@ -63,6 +63,15 @@ final class AppModel: ObservableObject {
     private var groupRequest: (id: String, kind: String, profile: String)?
     private var operationAccountSignature = ""
     private var accountRefreshTask: Task<Void, Never>?
+    private var operationTimeoutTask: Task<Void, Never>?
+    private var workerRestartTask: Task<Void, Never>?
+    private var workerRestartAttempt = 0
+    private var workerExitHandled = false
+    private var resumeAfterWorkerRestart = false
+    private var stopRequested = false
+    var workerRestartDelays: [TimeInterval] = [1, 2, 5, 10, 30]
+    var maxWorkerRestartAttempts = 5
+    var startupTimeoutOverride: TimeInterval?
 
     init(configURL: URL? = nil, demo: Bool? = nil, client: EngineConnection? = nil, loginItem: LoginItemManaging? = nil) {
         self.client = client ?? EngineClient()
@@ -76,8 +85,12 @@ final class AppModel: ObservableObject {
         self.client.onEvent = { [weak self] event in self?.receive(event) }
         self.client.onExit = { [weak self] in
             guard let self else { return }
-            self.engineAvailable = false
-            if self.quitting { self.quitCompletion?() }
+            if self.quitting {
+                let completion = self.quitCompletion
+                self.quitCompletion = nil
+                completion?()
+            }
+            else { self.handleWorkerExit() }
         }
         if isDemo { loadDemo() }
     }
@@ -92,7 +105,7 @@ final class AppModel: ObservableObject {
     var visibleTasks: [ApprovalTask] {
         tasks.filter { filter.includes($0) && (search.isEmpty || ($0.sender + $0.content + $0.mrs.map { $0.key + $0.title + $0.sourceBranch + $0.targetBranch }.joined()).localizedCaseInsensitiveContains(search)) }
     }
-    var completedCount: Int { tasks.filter { $0.status == "completed" }.count }
+    var completedCount: Int { tasks.filter { ["completed", "partial"].contains($0.status) }.count }
 
     func launch() {
         guard !launched else { return }
@@ -112,32 +125,162 @@ final class AppModel: ObservableObject {
         if settings.showWorkbenchOnLaunch { action() }
     }
 
-    private func launchWorker() {
+    private func launchWorker(restart: Bool = false) {
         guard !client.isRunning else { return }
+        if !restart {
+            workerRestartTask?.cancel(); workerRestartTask = nil
+            workerRestartAttempt = 0
+            stopRequested = false
+        }
+        workerExitHandled = false
         engineAvailable = false
-        status = "idle"
+        status = resumeAfterWorkerRestart ? "starting" : "idle"
         errorMessage = nil
         currentOperation = "launch"
         dingtalkAccount = AccountConnection(status: .checking)
         gitlabAccount = AccountConnection(status: .checking)
         do { try client.launch(dataDirectory: configURL.deletingLastPathComponent()) }
         catch {
+            operationTimeoutTask?.cancel(); operationTimeoutTask = nil
             currentOperation = nil
-            pendingAfterLaunch = nil
             failPendingAccounts(error.localizedDescription)
             errorMessage = error.localizedDescription
-            status = "error"
+            status = resumeAfterWorkerRestart ? "reconnecting" : "error"
+            scheduleWorkerRestart()
+            return
         }
+        beginOperationTimeout("launch", seconds: 12)
     }
 
     private func sendOperation(_ command: String, values: [String: Any] = [:]) {
         currentOperation = command
         operationAccountSignature = settings.accountSignature
-        client.send(command, settings: settings, values: values)
+        guard client.send(command, settings: settings, values: values) else {
+            failCurrentOperation("执行引擎未运行，无法发送 \(command)")
+            return
+        }
+        let timeout: TimeInterval = command == "start"
+            ? startupTimeoutOverride ?? max(60, TimeInterval(settings.commandTimeoutSeconds) + 15)
+            : max(15, TimeInterval(settings.commandTimeoutSeconds) + 15)
+        beginOperationTimeout(command, seconds: timeout)
+    }
+
+    private func beginOperationTimeout(_ command: String, seconds: TimeInterval) {
+        operationTimeoutTask?.cancel()
+        operationTimeoutTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            } catch { return }
+            guard let self, self.currentOperation == command else { return }
+            self.failCurrentOperation("执行引擎操作超时：\(command)")
+            if command == "launch" || command == "start" {
+                self.client.terminate()
+                self.scheduleWorkerRestart()
+            }
+        }
+    }
+
+    private func failCurrentOperation(_ message: String) {
+        let command = currentOperation
+        operationTimeoutTask?.cancel(); operationTimeoutTask = nil
+        currentOperation = nil
+        errorMessage = message
+        if command == "start" {
+            startRequestID = nil
+            listeningConfiguration = nil
+            status = connected ? "listening" : "error"
+        } else if command == "accounts" {
+            accountRequest = nil
+            failPendingAccounts(message)
+        } else if command == "groups" {
+            groupOperationID = nil
+            searchingGroups = false
+        } else if command == "profiles" {
+            loadingProfiles = false
+        } else if command == "login" {
+            authStatus = "failed"
+        }
+    }
+
+    @discardableResult
+    private func sendControl(_ command: String) -> Bool {
+        guard client.send(command) else {
+            connected = false
+            status = "error"
+            errorMessage = "执行引擎未运行，无法执行 \(command)"
+            return false
+        }
+        return true
+    }
+
+    private func scheduleWorkerRestart() {
+        guard !quitting, workerRestartTask == nil else { return }
+        guard !stopRequested || resumeAfterWorkerRestart else { return }
+        guard workerRestartAttempt < maxWorkerRestartAttempts else {
+            let message = "执行引擎多次启动失败，请检查运行组件后手动刷新"
+            engineAvailable = false
+            status = "error"
+            errorMessage = message
+            failPendingAccounts(message)
+            return
+        }
+        let delays = workerRestartDelays.isEmpty ? [1.0] : workerRestartDelays
+        let delay = delays[min(workerRestartAttempt, delays.count - 1)]
+        workerRestartAttempt += 1
+        workerRestartTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            } catch { return }
+            guard let self, !Task.isCancelled, !self.quitting else { return }
+            self.workerRestartTask = nil
+            self.launchWorker(restart: true)
+        }
+    }
+
+    private func handleWorkerExit() {
+        guard !quitting else { return }
+        guard !workerExitHandled else { return }
+        workerExitHandled = true
+        accountRefreshTask?.cancel(); accountRefreshTask = nil
+        let pendingIntent = pendingAfterLaunch
+        let shouldResume = resumeAfterWorkerRestart || isActive || status == "starting" ||
+            ["start", "auto_start"].contains(pendingIntent ?? "")
+        let intentionalStop = stopRequested && !shouldResume
+        resumeAfterWorkerRestart = shouldResume
+        engineAvailable = false
+        connected = false
+        operationTimeoutTask?.cancel(); operationTimeoutTask = nil
+        currentOperation = nil
+        accountRequest = nil
+        startRequestID = nil
+        listeningConfiguration = nil
+        groupRequest = nil
+        groupOperationID = nil
+        groupOptions = []
+        loadingProfiles = false
+        searchingGroups = false
+        pendingAccountRefresh = false
+        pendingProfiles = false
+        pendingAfterLaunch = pendingIntent == "check" ? "check" : shouldResume ? "start" : nil
+        queueCount = 0
+        activeCount = 0
+        for index in tasks.indices where tasks[index].waiting || tasks[index].running {
+            tasks[index].status = tasks[index].running ? "stopped" : "discarded"
+            tasks[index].summary = "执行引擎已退出，未完成的请求已终止"
+        }
+        let exitMessage = intentionalStop ? "执行引擎已退出" : "执行引擎已退出，正在自动重启"
+        failPendingAccounts(exitMessage)
+        if authStatus == "running" { authStatus = "failed" }
+        status = intentionalStop ? "stopped" : (shouldResume || pendingAfterLaunch != nil) ? "reconnecting" : "error"
+        errorMessage = intentionalStop ? nil : exitMessage
+        if !intentionalStop { scheduleWorkerRestart() }
     }
 
     func refreshAccounts() {
         guard !isDemo else { return }
+        workerRestartTask?.cancel(); workerRestartTask = nil
+        workerRestartAttempt = 0
+        stopRequested = false
         if !isActive, !isBusy { errorMessage = nil; if status == "error" { status = "idle" } }
         accountRefreshTask?.cancel(); accountRefreshTask = nil
         pendingAccountRefresh = true
@@ -215,7 +358,9 @@ final class AppModel: ObservableObject {
             try settings.save(to: configURL)
             configurationIssue = nil
             savedAt = Date()
-            if !isDemo { client.send("update_settings", settings: settings) }
+            if !isDemo, engineAvailable, !client.send("update_settings", settings: settings) {
+                errorMessage = "执行引擎未运行，设置已保存但会在重连后同步"
+            }
             if !isDemo, settings.accountSignature != previous.accountSignature { scheduleAccountRefresh() }
             else if !isDemo { runPendingOperations() }
             if settings.appearance != previous.appearance { applyAppearance() }
@@ -234,6 +379,9 @@ final class AppModel: ObservableObject {
     func start() {
         guard settings.validationIssue == nil, !isBusy, !isActive else { return }
         errorMessage = nil
+        resumeAfterWorkerRestart = true
+        stopRequested = false
+        workerRestartAttempt = 0
         if isDemo {
             listeningConfiguration = demoListeningConfiguration
             status = "listening"; connected = true; paused = false
@@ -274,7 +422,7 @@ final class AppModel: ObservableObject {
         if isDemo {
             paused.toggle(); status = paused ? "paused" : locked && !settings.processWhileLocked ? "locked" : "listening"
             if !paused { runDemoQueue() }
-        } else { client.send(paused ? "resume" : "pause") }
+        } else { sendControl(paused ? "resume" : "pause") }
     }
 
     func stop() {
@@ -287,15 +435,24 @@ final class AppModel: ObservableObject {
             status = "stopped"; connected = false; paused = false; activeCount = 0; queueCount = 0
             return
         }
+        resumeAfterWorkerRestart = false
+        stopRequested = true
+        workerRestartTask?.cancel(); workerRestartTask = nil
+        operationTimeoutTask?.cancel(); operationTimeoutTask = nil
+        guard client.isRunning else {
+            status = "stopped"; connected = false; paused = false
+            activeCount = 0; queueCount = 0; errorMessage = nil
+            return
+        }
         status = "stopping"
-        client.send("stop")
+        sendControl("stop")
     }
 
     func clearQueue() {
         if isDemo {
             for index in tasks.indices where tasks[index].waiting { tasks[index].status = "discarded"; tasks[index].summary = "已手动清空队列" }
             queueCount = 0
-        } else { client.send("clear_queue") }
+        } else { sendControl("clear_queue") }
     }
 
     func clearFinished() {
@@ -319,7 +476,12 @@ final class AppModel: ObservableObject {
             searchingGroups = false
         } else {
             groupOperationID = id
-            client.send("groups", settings: settings, values: ["kind": kind, "query": query, "request_id": id])
+            if !client.send("groups", settings: settings, values: ["kind": kind, "query": query, "request_id": id]) {
+                groupOperationID = nil
+                searchingGroups = false
+                showGroupPicker = false
+                errorMessage = "执行引擎未运行，无法查找群聊"
+            }
         }
     }
 
@@ -433,6 +595,9 @@ final class AppModel: ObservableObject {
         quitCompletion = completion
         demoRun?.cancel()
         accountRefreshTask?.cancel(); accountRefreshTask = nil
+        operationTimeoutTask?.cancel(); operationTimeoutTask = nil
+        workerRestartTask?.cancel(); workerRestartTask = nil
+        resumeAfterWorkerRestart = false
         pendingAfterLaunch = nil; pendingAccountRefresh = false; pendingProfiles = false
         guard client.isRunning else { completion(); return }
         status = "stopping"
@@ -443,17 +608,33 @@ final class AppModel: ObservableObject {
         switch event["type"] as? String {
         case "hello":
             engineAvailable = true
-            if currentOperation == "launch" { currentOperation = nil }
+            workerExitHandled = false
+            workerRestartAttempt = 0
+            stopRequested = false
+            if currentOperation == "launch" {
+                currentOperation = nil
+                operationTimeoutTask?.cancel(); operationTimeoutTask = nil
+            }
             guard !quitting else { return }
+            if resumeAfterWorkerRestart {
+                if pendingAfterLaunch == nil { pendingAfterLaunch = "start" }
+                status = "idle"
+            }
             pendingAccountRefresh = true
             if let issue = configurationIssue ?? settings.validationIssue {
                 failPendingAccounts("请先修正配置：\(issue)")
                 return
             }
-            client.send("configure", settings: settings)
+            guard client.send("configure", settings: settings) else {
+                failCurrentOperation("执行引擎未就绪，无法同步配置")
+                return
+            }
             runPendingOperations()
         case "operation_finished":
             let command = event["command"] as? String ?? ""
+            if command == "start", let requested = event["request_id"] as? String {
+                guard let current = startRequestID, requested == current else { return }
+            }
             if command == "groups" {
                 guard acceptsGroupEvent(event) else { return }
                 groupOperationID = nil
@@ -465,8 +646,15 @@ final class AppModel: ObservableObject {
                 }
                 accountRequest = nil
             }
-            if currentOperation == command { currentOperation = nil }
-            if command == "start" { startRequestID = nil; listeningConfiguration = nil }
+            if currentOperation == command {
+                currentOperation = nil
+                operationTimeoutTask?.cancel(); operationTimeoutTask = nil
+            }
+            if command == "start" {
+                startRequestID = nil
+                listeningConfiguration = nil
+                resumeAfterWorkerRestart = false
+            }
             if command == "profiles" { loadingProfiles = false }
             if command == "groups" { searchingGroups = false }
             runPendingOperations()
@@ -478,6 +666,16 @@ final class AppModel: ObservableObject {
             if let value = event["queue_count"] as? Int { queueCount = value }
             if let value = event["active_count"] as? Int { activeCount = value }
             if let value = event["error"] as? String, !value.isEmpty { errorMessage = value }
+            if currentOperation == "start",
+               ["listening", "paused", "locked", "reconnecting"].contains(status) {
+                operationTimeoutTask?.cancel(); operationTimeoutTask = nil
+            }
+            if status == "stopped" {
+                stopRequested = false
+                resumeAfterWorkerRestart = false
+            } else if status == "error" {
+                resumeAfterWorkerRestart = false
+            }
         case "task":
             guard let data = event["task"] as? [String: Any] else { return }
             let task = ApprovalTask(data)
@@ -559,22 +757,17 @@ final class AppModel: ObservableObject {
             loadingProfiles = false
             if isBusy { status = connected ? "listening" : "error" }
             if authStatus == "running" { authStatus = "failed" }
+            if event["command"] as? String == currentOperation {
+                operationTimeoutTask?.cancel(); operationTimeoutTask = nil
+            }
             if event["operation_rejected"] as? Bool == true, event["command"] as? String == currentOperation {
                 currentOperation = nil
                 accountRequest = nil
                 pendingAfterLaunch = nil
             }
         case "worker_exit":
-            engineAvailable = false; connected = false
-            currentOperation = nil; accountRequest = nil
-            startRequestID = nil; listeningConfiguration = nil
-            groupRequest = nil; groupOperationID = nil; groupOptions = []
-            loadingProfiles = false; searchingGroups = false
-            pendingAfterLaunch = nil; pendingAccountRefresh = false; pendingProfiles = false
             accountRefreshTask?.cancel(); accountRefreshTask = nil
-            failPendingAccounts("执行引擎已退出，请刷新账号重试")
-            if authStatus == "running" { authStatus = "failed" }
-            if !quitting { status = "error"; errorMessage = "执行引擎已退出，可在连接与账号中刷新重试" }
+            handleWorkerExit()
         default: break
         }
     }
@@ -625,7 +818,14 @@ final class AppModel: ObservableObject {
                  "title": titles[n % titles.count], "status": sample.2 == "partial" && n == 1 ? "failed" : sample.2 == "completed" || sample.2 == "partial" ? "completed" : "waiting",
                  "source_branch": "feature/inventory-writeback", "target_branch": "gray3/261008",
                  "changes_count": String(4 + n * 2), "commit_count": n + 2, "author": sample.1,
-                 "actor": "演示账号", "merged_by": "演示账号", "elapsed": Double(6 + n * 2),
+                 "actor": "演示账号",
+                 "approvers": sample.2 == "completed" || sample.2 == "partial" ? ["杨恒", "演示账号"] : [],
+                 "approvals_known": sample.2 == "completed" || sample.2 == "partial",
+                 "approved_by_own": sample.2 == "completed" || sample.2 == "partial",
+                 "merged_by": sample.2 == "partial" && n == 1 ? "" : "演示账号",
+                 "merge_owner_known": !(sample.2 == "partial" && n == 1),
+                 "owned_merge": !(sample.2 == "partial" && n == 1),
+                 "elapsed": Double(6 + n * 2),
                  "sha": "e42a78c", "approved": true,
                  "error": sample.2 == "partial" && n == 1 ? "目标分支存在代码冲突，需要在 GitLab 中解决后重新提交请求。" : ""]
             }

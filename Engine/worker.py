@@ -352,14 +352,26 @@ class Controller:
                 self.console.debug_enabled = self.settings["debug_output"]
                 self.runtime.emit_state()
             self.events.send("configured")
+            self.events.send("command_ack", command=command, request_id=message.get("request_id"))
         elif command == "stop":
-            self.stop()
+            if self.runtime or (self.run_thread and self.run_thread.is_alive()):
+                self.stop()
+            else:
+                self.events.send("state", status="stopped", connected=False, queue_count=0, active_count=0)
+                self.events.send("command_ack", command=command, request_id=message.get("request_id"))
         elif command in ("pause", "resume"):
             if self.runtime:
                 self.runtime.set_paused(command == "pause")
+                self.events.send("command_ack", command=command, request_id=message.get("request_id"))
+            else:
+                self.events.send("error", command=command, request_id=message.get("request_id"),
+                                 message="监听尚未启动，无法暂停或恢复")
         elif command == "clear_queue":
             if self.runtime:
-                self.runtime.clear_queue()
+                count = self.runtime.clear_queue()
+            else:
+                count = 0
+            self.events.send("command_ack", command=command, request_id=message.get("request_id"), count=count)
         elif command == "auth_input":
             if self.auth_master is not None:
                 os.write(self.auth_master, str(message.get("text", "\n")).encode())

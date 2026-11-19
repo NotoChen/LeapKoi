@@ -53,6 +53,8 @@ jobs:
           fi
       - name: Engine tests
         run: '"$APPROVALDESK_PYTHON" -B -m unittest discover -s Tests/EngineTests -v'
+      - name: Configuration contract
+        run: '"$APPROVALDESK_PYTHON" -B scripts/check_configuration.py'
       - name: Native tests
         run: swift test -j 2
       - name: Download pinned components

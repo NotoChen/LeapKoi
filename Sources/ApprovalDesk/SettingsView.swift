@@ -112,7 +112,7 @@ struct SettingsView: View {
                 }
             }.onAppear { model.loadProfiles() }
             SettingsSection("GitLab") {
-                SettingsRow("服务地址", detail: "填写主机名") { TextField("git2.superboss.cc", text: $model.settings.gitlabHost).textFieldStyle(.roundedBorder).frame(width: 255) }
+                SettingsRow("服务地址", detail: "填写主机名") { DebouncedTextField(placeholder: "git2.superboss.cc", text: $model.settings.gitlabHost, width: 255) }
                 Divider()
                 SettingsRow("当前账号", detail: model.gitlabAccount.explanation) {
                     accountLabel(model.gitlabAccount)
@@ -122,7 +122,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("当前账号 Token（可选）").font(.system(size: 12, weight: .medium))
                     Text("留空使用已有登录，也可以直接填写 Token。内容保存在本地 JSON 配置中。").font(.system(size: 10)).foregroundStyle(.secondary)
-                    TextField("GitLab 访问令牌", text: $model.settings.gitlabToken).textFieldStyle(.roundedBorder).font(.system(size: 11, design: .monospaced))
+                    DebouncedTextField(placeholder: "GitLab 访问令牌", text: $model.settings.gitlabToken, monospaced: true, secure: true)
                 }.padding(.vertical, 12)
             }
             HStack {
@@ -181,9 +181,9 @@ struct SettingsView: View {
             Text(title).font(.system(size: 12, weight: .medium))
             Text(detail).font(.system(size: 10)).foregroundStyle(.secondary)
             HStack {
-                TextField("群名称", text: Binding(get: { kind == "approval" ? model.settings.approvalGroup : model.settings.senderGroup }, set: { value in
+                DebouncedTextField(placeholder: "群名称", text: Binding(get: { kind == "approval" ? model.settings.approvalGroup : model.settings.senderGroup }, set: { value in
                     model.updateGroupName(value, kind: kind)
-                })).textFieldStyle(.roundedBorder)
+                }))
                 Button("查找并选择") { model.beginGroupSearch(kind: kind, query: kind == "approval" ? model.settings.approvalGroup : model.settings.senderGroup) }.disabled(model.isBusy)
             }
             let selected = kind == "approval" ? model.settings.approvalGroupId : model.settings.senderGroupId
@@ -235,7 +235,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("备用账号 Token").font(.system(size: 12, weight: .medium))
                     Text("此账号负责审批和合并自己创建的 MR。Token 保存在普通 JSON 配置中。").font(.system(size: 10)).foregroundStyle(.secondary)
-                    TextField("可选", text: $model.settings.fallbackToken).textFieldStyle(.roundedBorder).font(.system(size: 11, design: .monospaced))
+                    DebouncedTextField(placeholder: "可选", text: $model.settings.fallbackToken, monospaced: true, secure: true)
                 }.padding(.vertical, 12)
             }
             SettingsSection("消息回执") {
@@ -330,7 +330,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 9) {
             Text(title).font(.system(size: 12, weight: .medium))
             HStack {
-                TextField("自动选择", text: value).textFieldStyle(.roundedBorder).font(.system(size: 10, design: .monospaced))
+                DebouncedTextField(placeholder: "自动选择", text: value, monospaced: true, fontSize: 10)
                 Button("选择") {
                     let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
                     if panel.runModal() == .OK, let url = panel.url { value.wrappedValue = url.path }

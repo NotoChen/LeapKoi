@@ -5,15 +5,18 @@ protocol EngineConnection: AnyObject {
     var onExit: (() -> Void)? { get set }
     var isRunning: Bool { get }
     func launch(dataDirectory: URL) throws
-    func send(_ command: String, settings: AppSettings?, values: [String: Any])
+    @discardableResult func send(_ command: String, settings: AppSettings?, values: [String: Any]) -> Bool
     func shutdown()
+    func terminate()
 }
 
 extension EngineConnection {
-    func send(_ command: String, settings: AppSettings? = nil) {
+    @discardableResult
+    func send(_ command: String, settings: AppSettings? = nil) -> Bool {
         send(command, settings: settings, values: [:])
     }
-    func send(_ command: String, values: [String: Any]) {
+    @discardableResult
+    func send(_ command: String, values: [String: Any]) -> Bool {
         send(command, settings: nil, values: values)
     }
 }
@@ -96,20 +99,40 @@ final class EngineClient: EngineConnection {
         }
     }
 
-    func send(_ command: String, settings: AppSettings? = nil, values: [String: Any] = [:]) {
+    @discardableResult
+    func send(_ command: String, settings: AppSettings? = nil, values: [String: Any] = [:]) -> Bool {
         var payload = values
         payload["command"] = command
         if let settings { payload["settings"] = settings.dictionary() }
-        guard var data = try? JSONSerialization.data(withJSONObject: payload), let input else { return }
+        guard var data = try? JSONSerialization.data(withJSONObject: payload) else {
+            onEvent?(["type": "error", "command": command, "operation_rejected": true,
+                      "message": "无法编码执行引擎命令：\(command)"])
+            return false
+        }
+        guard let input else {
+            onEvent?(["type": "error", "command": command, "operation_rejected": true,
+                      "message": "执行引擎未运行"])
+            return false
+        }
         data.append(10)
-        do { try input.write(contentsOf: data) }
-        catch { onEvent?(["type": "error", "command": command, "operation_rejected": true,
-                         "message": "无法连接执行引擎：\(error.localizedDescription)"]) }
+        do {
+            try input.write(contentsOf: data)
+            return true
+        } catch {
+            onEvent?(["type": "error", "command": command, "operation_rejected": true,
+                      "message": "无法连接执行引擎：\(error.localizedDescription)"])
+            return false
+        }
     }
 
     func shutdown() {
-        send("shutdown")
+        _ = send("shutdown")
         try? input?.close()
         input = nil
+    }
+
+    func terminate() {
+        guard let child = process, child.isRunning else { return }
+        child.terminate()
     }
 }

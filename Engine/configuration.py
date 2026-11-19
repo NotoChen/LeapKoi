@@ -53,6 +53,10 @@ DEFAULTS: dict[str, Any] = {
 
 def validate(raw: dict[str, Any]) -> dict[str, Any]:
     result = DEFAULTS | {k: v for k, v in raw.items() if k in DEFAULTS}
+    if isinstance(result["schema_version"], bool) or not isinstance(result["schema_version"], int):
+        raise ValueError("schema_version 必须为整数")
+    if result["schema_version"] != DEFAULTS["schema_version"]:
+        raise ValueError(f"不支持的配置版本：{result['schema_version']}")
     for key, value in DEFAULTS.items():
         if isinstance(value, bool) and not isinstance(result[key], bool):
             raise ValueError(f"{key} 必须为开关值")

@@ -30,6 +30,7 @@ private final class FakeEngineConnection: EngineConnection {
     var onExit: (() -> Void)?
     var isRunning = false
     var launchError: Error?
+    var failSends = false
     var launchCount = 0
     var sent: [Command] = []
     var commands: [String] { sent.map(\.name) }
@@ -42,10 +43,14 @@ private final class FakeEngineConnection: EngineConnection {
         if let launchError { throw launchError }
         isRunning = true
     }
-    func send(_ command: String, settings: AppSettings?, values: [String: Any]) {
-        if isRunning { sent.append(Command(name: command, settings: settings, values: values)) }
+    @discardableResult
+    func send(_ command: String, settings: AppSettings?, values: [String: Any]) -> Bool {
+        guard isRunning, !failSends else { return false }
+        sent.append(Command(name: command, settings: settings, values: values))
+        return true
     }
-    func shutdown() { send("shutdown", settings: nil, values: [:]) }
+    func shutdown() { _ = send("shutdown", settings: nil, values: [:]) }
+    func terminate() { isRunning = false }
 }
 
 @MainActor
@@ -68,6 +73,14 @@ final class AppModelTests: XCTestCase {
 
     private func finishAccounts(_ model: AppModel, _ client: FakeEngineConnection) {
         model.receive(["type": "operation_finished", "command": "accounts", "request_id": client.accountRequestID])
+    }
+
+    private func waitUntil(_ condition: () -> Bool, timeout: TimeInterval = 2) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            precondition(Date() < deadline, "Timed out waiting for state change")
+            try await Task.sleep(for: .milliseconds(5))
+        }
     }
 
     private func listeningEvent(_ client: FakeEngineConnection) -> [String: Any] {
@@ -279,6 +292,124 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.status, "idle")
         XCTAssertEqual(model.errorMessage, nil)
         XCTAssertEqual(client.commands.contains("start"), false)
+    }
+
+    func testUnexpectedWorkerExitRestartsEngineWithoutStartingListener() async throws {
+        let (model, client, folder) = try fixture()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        model.workerRestartDelays = [0.01]
+        model.launch(); model.receive(["type": "hello"])
+        ready(model, client); finishAccounts(model, client)
+        client.isRunning = false
+        model.receive(["type": "worker_exit"])
+        XCTAssertEqual(model.status, "error")
+        try await waitUntil { client.launchCount == 2 }
+        model.receive(["type": "hello"])
+        ready(model, client); finishAccounts(model, client)
+        XCTAssertEqual(model.status, "idle")
+        XCTAssertEqual(client.commands.filter { $0 == "start" }.count, 0)
+        XCTAssertEqual(client.commands.filter { $0 == "configure" }.count, 2)
+    }
+
+    func testManualStopDoesNotRestartAnExitedWorker() async throws {
+        let (model, client, folder) = try fixture()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        model.workerRestartDelays = [0.01]
+        model.launch(); model.receive(["type": "hello"])
+        ready(model, client); finishAccounts(model, client)
+        model.stop()
+        client.isRunning = false
+        model.receive(["type": "worker_exit"])
+        XCTAssertEqual(model.status, "stopped")
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(client.launchCount, 1)
+    }
+
+    func testWorkerRestartResumesAnActiveListener() async throws {
+        let (model, client, folder) = try fixture(autoStart: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        model.workerRestartDelays = [0.01]
+        model.launch(); model.receive(["type": "hello"])
+        ready(model, client); finishAccounts(model, client)
+        model.receive(["type": "state", "status": "listening", "connected": true])
+        client.isRunning = false
+        model.receive(["type": "worker_exit"])
+        XCTAssertEqual(model.status, "reconnecting")
+        try await waitUntil { client.launchCount == 2 }
+        model.receive(["type": "hello"])
+        ready(model, client); finishAccounts(model, client)
+        XCTAssertEqual(client.commands.filter { $0 == "start" }.count, 2)
+    }
+
+    func testWorkerRestartPreservesPendingCheckWithoutStartingListener() async throws {
+        let (model, client, folder) = try fixture()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        model.workerRestartDelays = [0.01]
+        model.launch(); model.receive(["type": "hello"])
+        ready(model, client); finishAccounts(model, client)
+        client.isRunning = false
+        model.checkEnvironment()
+        XCTAssertEqual(model.status, "idle")
+        client.isRunning = false
+        model.receive(["type": "worker_exit"])
+        try await waitUntil { client.launchCount == 3 }
+        model.receive(["type": "hello"])
+        ready(model, client); finishAccounts(model, client)
+        XCTAssertEqual(client.commands.last, "check")
+        XCTAssertEqual(client.commands.filter { $0 == "start" }.count, 0)
+    }
+
+    func testListeningStateCancelsStartupTimeout() async throws {
+        let (model, client, folder) = try fixture(autoStart: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        model.workerRestartDelays = [0.01]
+        model.startupTimeoutOverride = 0.03
+        model.launch(); model.receive(["type": "hello"])
+        ready(model, client); finishAccounts(model, client)
+        model.receive(["type": "state", "status": "listening", "connected": true])
+        try await Task.sleep(for: .milliseconds(70))
+        XCTAssertEqual(client.launchCount, 1)
+        XCTAssertEqual(client.commands.filter { $0 == "start" }.count, 1)
+        XCTAssertEqual(model.status, "listening")
+    }
+
+    func testWorkerRestartStopsAfterBoundedAttempts() async throws {
+        let (model, client, folder) = try fixture()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        model.workerRestartDelays = [0.01]
+        model.maxWorkerRestartAttempts = 2
+        client.launchError = NSError(domain: "Fixture", code: 2, userInfo: [NSLocalizedDescriptionKey: "组件缺失"])
+        model.launch()
+        try await waitUntil { client.launchCount == 3 }
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(client.launchCount, 3)
+        XCTAssertEqual(model.status, "error")
+        XCTAssertTrue(model.errorMessage?.contains("多次启动失败") == true)
+    }
+
+    func testRejectedGroupSendDoesNotLeaveTheModelBusy() throws {
+        let (model, client, folder) = try fixture()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        model.launch(); model.receive(["type": "hello"])
+        ready(model, client); finishAccounts(model, client)
+        client.failSends = true
+        model.beginGroupSearch(kind: "approval", query: "测试群")
+        XCTAssertFalse(model.isBusy)
+        XCTAssertFalse(model.searchingGroups)
+        XCTAssertFalse(model.showGroupPicker)
+        XCTAssertTrue(model.errorMessage?.contains("无法查找群聊") == true)
+    }
+
+    func testCompletedCountIncludesPartialTasks() throws {
+        let (model, _, folder) = try fixture()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        model.tasks = [
+            ApprovalTask(["id": "done", "sender": "成员", "status": "completed"]),
+            ApprovalTask(["id": "partial", "sender": "成员", "status": "partial"]),
+            ApprovalTask(["id": "failed", "sender": "成员", "status": "failed"])
+        ]
+        XCTAssertEqual(model.completedCount, 2)
+        XCTAssertEqual(TaskFilter.completed.includes(model.tasks[1]), true)
     }
 
     func testWorkerLaunchFailureDoesNotLeaveAccountsLoading() throws {

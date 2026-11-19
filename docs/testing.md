@@ -11,7 +11,7 @@
 | Apple Silicon / arm64 | `macos-26` | Xcode 26.3 |
 | Intel / x86_64 | `macos-15-intel` | Xcode 26.3 |
 
-每个架构独立执行 Python 引擎检查、原生 XCTest、组件下载、Release 构建、DMG/ZIP 生成和安装包检查。安装包检查使用临时目录和系统 PATH，验证：
+每个架构独立执行 Python 引擎检查、配置契约检查、原生 XCTest、组件下载、Release 构建、DMG/ZIP 生成和安装包检查。安装包检查使用临时目录和系统 PATH，验证：
 
 - 应用、Python、DWS、glab 和全部动态库的架构一致。
 - 动态库不依赖构建机的 Homebrew 或个人 Python 路径。
@@ -27,11 +27,12 @@
 
 ```sh
 python3 -B -m unittest discover -s Tests/EngineTests -v
+python3 -B scripts/check_configuration.py
 python3 -B scripts/check_models.py
 python3 -B scripts/release_metadata.py
 ```
 
-仅安装 Command Line Tools 时，`check_models.py` 使用同一组原生断言，不依赖 XCTest。安装完整 Xcode 后可运行 `swift test -j 2`。
+`check_configuration.py` 会编译一次原生配置模型并在临时目录中比较 41 项默认值，防止 Python 与 Swift 配置漂移。仅安装 Command Line Tools 时，`check_models.py` 使用同一组原生断言，不依赖 XCTest。安装完整 Xcode 后可运行 `swift test -j 2`。
 
 GUI 预览由 `scripts/render_previews.py` 渲染实际 SwiftUI 视图及 AppKit 设置窗口，全部请求使用模拟数据。它用于检查深浅色、布局、原生窗口控件和图标；真实桌面上的动态玻璃合成仍以实机显示为准。
 

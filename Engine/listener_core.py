@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import ctypes
 from dataclasses import dataclass, field
 from datetime import datetime
 import fcntl
@@ -126,10 +127,87 @@ class ScreenLockGuard:
         self._state_lock = threading.Lock()
         self._last_locked: bool | None = None
         self._last_error_at = 0.0
+        self._native_session_ready = False
+        self._native_session_lock = threading.Lock()
+        self._core_graphics: Any = None
+        self._core_foundation: Any = None
+
+    def _prepare_native_session(self) -> bool:
+        with self._native_session_lock:
+            if self._native_session_ready:
+                return self._core_graphics is not None and self._core_foundation is not None
+            self._native_session_ready = True
+            if sys.platform != "darwin":
+                return False
+            try:
+                core_graphics = ctypes.CDLL(
+                    "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+                )
+                core_foundation = ctypes.CDLL(
+                    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+                )
+                core_graphics.CGSessionCopyCurrentDictionary.restype = ctypes.c_void_p
+                core_foundation.CFStringCreateWithCString.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_char_p,
+                    ctypes.c_uint32,
+                ]
+                core_foundation.CFStringCreateWithCString.restype = ctypes.c_void_p
+                core_foundation.CFDictionaryGetValue.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                ]
+                core_foundation.CFDictionaryGetValue.restype = ctypes.c_void_p
+                core_foundation.CFGetTypeID.argtypes = [ctypes.c_void_p]
+                core_foundation.CFGetTypeID.restype = ctypes.c_ulong
+                core_foundation.CFBooleanGetTypeID.restype = ctypes.c_ulong
+                core_foundation.CFBooleanGetValue.argtypes = [ctypes.c_void_p]
+                core_foundation.CFBooleanGetValue.restype = ctypes.c_bool
+                core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
+                self._core_graphics = core_graphics
+                self._core_foundation = core_foundation
+                return True
+            except (AttributeError, OSError):
+                self._core_graphics = None
+                self._core_foundation = None
+                return False
+
+    def _read_locked_native(self) -> bool | None:
+        if not self._prepare_native_session():
+            return None
+        assert self._core_graphics is not None
+        assert self._core_foundation is not None
+        session = self._core_graphics.CGSessionCopyCurrentDictionary()
+        if not session:
+            return None
+        key = self._core_foundation.CFStringCreateWithCString(
+            None,
+            b"CGSSessionScreenIsLocked",
+            0x08000100,
+        )
+        try:
+            if not key:
+                return None
+            value = self._core_foundation.CFDictionaryGetValue(session, key)
+            if not value:
+                return False
+            if (
+                self._core_foundation.CFGetTypeID(value)
+                != self._core_foundation.CFBooleanGetTypeID()
+            ):
+                return None
+            return bool(self._core_foundation.CFBooleanGetValue(value))
+        finally:
+            if key:
+                self._core_foundation.CFRelease(key)
+            self._core_foundation.CFRelease(session)
 
     def _read_locked(self) -> bool:
         if sys.platform != "darwin":
             return False
+        native = self._read_locked_native()
+        if native is not None:
+            return native
 
         try:
             completed = subprocess.run(
@@ -611,11 +689,27 @@ class MRPlan:
     ref: MRRef
     details: MRDetails
     approvals: ApprovalInfo | None
+    approvals_known: bool
     use_leader: bool
     actor: Identity
     needs_approval: bool
     already_merged: bool
     third_party_approvers: set[str] = field(default_factory=set)
+
+
+@dataclass
+class MRResult:
+    approved_count: int = 0
+    merged_count: int = 0
+    error: str | None = None
+    owned_merge: bool = False
+    receipt_eligible: bool = False
+    no_received_reasons: set[str] = field(default_factory=set)
+    approvers: tuple[str, ...] = ()
+    approvals_known: bool = False
+    approved_by_own: bool = False
+    merged_by: str = ""
+    merge_owner_known: bool = False
 
 
 @dataclass(frozen=True)
@@ -633,6 +727,10 @@ class RecentKeys:
         self._values: OrderedDict[str, None] = OrderedDict()
         self._lock = threading.Lock()
 
+    def contains(self, key: str) -> bool:
+        with self._lock:
+            return key in self._values
+
     def add_if_new(self, key: str) -> bool:
         with self._lock:
             if key in self._values:
@@ -642,6 +740,10 @@ class RecentKeys:
             while len(self._values) > self.limit:
                 self._values.popitem(last=False)
             return True
+
+    def forget(self, key: str) -> None:
+        with self._lock:
+            self._values.pop(key, None)
 
 
 def parse_mr_url(raw_url: str, gitlab_host: str = DEFAULT_GITLAB_HOST) -> MRRef:
@@ -804,8 +906,10 @@ class GlabClient:
 
     def validate_capabilities(self) -> None:
         checks = (
-            ([self.executable, "api", "--help"], ("--paginate", "--output")),
-            ([self.executable, "mr", "approve", "--help"], ("--sha",)),
+            (
+                [self.executable, "api", "--help"],
+                ("--hostname", "--method", "--field", "--paginate", "--output"),
+            ),
         )
         for command, required_flags in checks:
             completed = run_command(
@@ -860,8 +964,7 @@ class GlabClient:
             username=str(payload.get("username") or ""),
         )
 
-    def details(self, ref: MRRef, use_leader: bool = False) -> MRDetails:
-        payload = self.api(ref.api_base, f"查询 {ref.key}", use_leader)
+    def _parse_details(self, ref: MRRef, payload: Any) -> MRDetails:
         if not isinstance(payload, dict):
             raise AutomationError(f"{ref.key} 详情格式异常")
         author = payload.get("author") if isinstance(payload.get("author"), dict) else {}
@@ -913,6 +1016,10 @@ class GlabClient:
             updated_at=str(payload.get("updated_at") or ""),
             web_url=web_url.strip() if isinstance(web_url, str) and web_url.strip() else ref.url,
         )
+
+    def details(self, ref: MRRef, use_leader: bool = False) -> MRDetails:
+        payload = self.api(ref.api_base, f"查询 {ref.key}", use_leader)
+        return self._parse_details(ref, payload)
 
     def commit_count(self, ref: MRRef, use_leader: bool = False) -> int:
         description = f"查询 {ref.key} 提交数"
@@ -972,13 +1079,14 @@ class GlabClient:
         run_command(
             [
                 self.executable,
-                "mr",
-                "approve",
-                str(ref.iid),
-                "-R",
-                ref.repo_url,
-                "--sha",
-                sha,
+                "api",
+                f"{ref.api_base}/approve",
+                "--hostname",
+                self.hostname,
+                "--method",
+                "POST",
+                "--field",
+                f"sha={sha}",
             ],
             console=self.console,
             description=f"审批 {ref.key}",
@@ -986,7 +1094,7 @@ class GlabClient:
             retryable_unknown=True,
         )
 
-    def merge(self, ref: MRRef, sha: str, use_leader: bool) -> None:
+    def merge(self, ref: MRRef, sha: str, use_leader: bool) -> MRDetails | None:
         completed = run_command(
             [
                 self.executable,
@@ -1004,7 +1112,13 @@ class GlabClient:
             env=self.environment(use_leader),
             retryable_unknown=True,
         )
-        parse_json_output(completed, f"合并 {ref.key}")
+        payload = parse_json_output(completed, f"合并 {ref.key}")
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return self._parse_details(ref, payload)
+        except AutomationError:
+            return None
 
 
 class DwsClient:
@@ -1510,9 +1624,12 @@ class ApprovalEngine:
         self.notifier = notifier
         self.screen_lock = screen_lock
         self.stop_event = stop_event
-        self.own_user_ids = {primary_identity.user_id}
+        self.local_user_ids = {primary_identity.user_id}
         if leader_identity is not None:
-            self.own_user_ids.add(leader_identity.user_id)
+            self.local_user_ids.add(leader_identity.user_id)
+        # Receipt policy may intentionally exclude the fallback account; UI
+        # ownership still treats every configured local identity as "本机".
+        self.own_user_ids = set(self.local_user_ids)
 
     def _wait_until_unlocked(self, action: str) -> None:
         if not self.screen_lock.wait_until_unlocked(self.stop_event, action):
@@ -1522,8 +1639,28 @@ class ApprovalEngine:
         return {
             name
             for user_id, name in approvals.approved_by.items()
-            if user_id not in self.own_user_ids
+            if user_id not in self.local_user_ids
         }
+
+    def _approver_names(self, approvals: ApprovalInfo | None) -> tuple[str, ...]:
+        if approvals is None:
+            return ()
+        return tuple(sorted({name for name in approvals.approved_by.values() if name}))
+
+    def _approved_by_own(self, approvals: ApprovalInfo | None) -> bool:
+        return approvals is not None and any(
+            user_id in self.local_user_ids for user_id in approvals.approved_by
+        )
+
+    @staticmethod
+    def _mark_actor_approved(
+        approvals: ApprovalInfo,
+        actor: Identity,
+    ) -> ApprovalInfo:
+        approvals.approved_by.setdefault(actor.user_id, actor.name)
+        approvals.user_has_approved = True
+        approvals.approvals_left = max(0, approvals.approvals_left - 1)
+        return approvals
 
     def _record_non_own_merge(
         self,
@@ -1545,17 +1682,10 @@ class ApprovalEngine:
         if not details.state:
             raise AutomationError(f"{prefix} 缺少状态")
 
-        try:
-            commit_count: int | None = self.glab.commit_count(ref)
-        except AutomationError as error:
-            commit_count = None
-            self.console.warning(f"{prefix} 无法读取提交数，将继续处理：{error}")
-            self.console.debug(error.detail)
         self.console.info(
             f"{prefix} MR 信息："
             f"{details.source_branch or '未知'} → {details.target_branch or '未知'}，"
             f"变更文件={details.changes_count or '未知'}，"
-            f"提交={commit_count if commit_count is not None else '未知'}，"
             f"创建={format_gitlab_time(details.created_at)}，"
             f"更新={format_gitlab_time(details.updated_at)}"
         )
@@ -1563,10 +1693,17 @@ class ApprovalEngine:
         if details.state == "merged":
             merged_by = details.merged_by_name or "未知人员"
             self.console.warning(f"{prefix} 原本已经由 {merged_by} 合并")
+            approvals: ApprovalInfo | None = None
+            try:
+                approvals = self.glab.approvals(ref, False)
+            except AutomationError as error:
+                self.console.warning(f"{prefix} 无法读取审批人，继续展示合并结果：{error}")
+                self.console.debug(error.detail)
             return MRPlan(
                 ref=ref,
                 details=details,
-                approvals=None,
+                approvals=approvals,
+                approvals_known=approvals is not None,
                 use_leader=False,
                 actor=self.primary_identity,
                 needs_approval=False,
@@ -1616,6 +1753,7 @@ class ApprovalEngine:
             ref=ref,
             details=details,
             approvals=approvals,
+            approvals_known=True,
             use_leader=use_leader,
             actor=actor,
             needs_approval=needs_approval,
@@ -1653,17 +1791,10 @@ class ApprovalEngine:
                 if actor_has_approved:
                     return approvals
                 raise
-            approvals = self.glab.approvals(plan.ref, plan.use_leader)
-            plan.third_party_approvers.update(self._third_party_names(approvals))
-            actor_has_approved = (
-                plan.actor.user_id in approvals.approved_by or approvals.user_has_approved
-            )
-            if not actor_has_approved:
-                raise AutomationError(
-                    f"{plan.ref.key} 审批命令已返回，但暂未确认审批成功",
-                    retryable=True,
-                )
-            return approvals
+            # A successful approve request is the write acknowledgement. The
+            # merge call remains the authoritative check that the required
+            # approvals are now satisfied, avoiding one extra status request.
+            return self._mark_actor_approved(approvals, plan.actor)
 
         return retry_operation(
             attempt,
@@ -1714,19 +1845,31 @@ class ApprovalEngine:
         if current.sha != plan.details.sha:
             raise AutomationError(f"{plan.ref.key} 代码版本已经变化")
 
-    def _merge_attempt(self, plan: MRPlan) -> MRDetails:
+    def _merge_attempt(
+        self,
+        plan: MRPlan,
+        *,
+        verify_before_write: bool = False,
+    ) -> MRDetails:
         self._wait_until_unlocked("合并")
-        # Recheck before every write, including retries: another client may
-        # have finished the merge during approval, polling, or backoff.
-        current = self.glab.details(plan.ref)
-        if current.state == "merged":
-            return current
-        self._check_merge_candidate(plan, current)
+        if verify_before_write:
+            # Retries must not repeat a merge after an ambiguous first response.
+            # The first attempt goes straight to the SHA-guarded merge endpoint
+            # so another person merging during approval costs no extra roundtrip.
+            current = self.glab.details(plan.ref)
+            if current.state == "merged":
+                return current
+            self._check_merge_candidate(plan, current)
         self._wait_until_unlocked("合并")
         merge_error: AutomationError | None = None
         initial: MRDetails | None = None
+        merged_details: MRDetails | None = None
         try:
-            self.glab.merge(plan.ref, plan.details.sha, plan.use_leader)
+            merged_details = self.glab.merge(
+                plan.ref,
+                plan.details.sha,
+                plan.use_leader,
+            )
         except AutomationError as error:
             merge_error = error
             self.console.warning(
@@ -1746,6 +1889,10 @@ class ApprovalEngine:
             if not error.retryable:
                 raise
             initial = current
+        else:
+            if merged_details is not None and merged_details.state == "merged":
+                return merged_details
+            initial = merged_details
 
         try:
             return self._wait_until_merged(plan, initial)
@@ -1761,14 +1908,21 @@ class ApprovalEngine:
 
     def _merge_until_confirmed(self, plan: MRPlan) -> MRDetails:
         errors: list[AutomationError] = []
+        first_attempt = True
 
         def attempt() -> MRDetails:
+            nonlocal first_attempt
             try:
-                return self._merge_attempt(plan)
+                return self._merge_attempt(
+                    plan,
+                    verify_before_write=not first_attempt,
+                )
             except AutomationError as error:
                 if not any(str(error) in str(previous) for previous in errors):
                     errors.append(error)
                 raise
+            finally:
+                first_attempt = False
 
         try:
             return retry_operation(
@@ -1796,28 +1950,33 @@ class ApprovalEngine:
         ref: MRRef,
         index: int,
         total: int,
-    ) -> tuple[int, int, str | None, bool | None, set[str]]:
+    ) -> MRResult:
         prefix = f"[{index}/{total}] {ref.key}"
         approval_count = 0
         no_received_reasons: set[str] = set()
         plan: MRPlan | None = None
         final_details: MRDetails | None = None
+        approvals: ApprovalInfo | None = None
+        approvals_known = False
 
         try:
             self.console.info(f"{prefix} 开始独立处理")
             plan = self._preflight_one(ref, index, total)
+            approvals = plan.approvals
+            approvals_known = plan.approvals_known
 
             if plan.already_merged:
                 final_details = plan.details
             else:
                 if plan.needs_approval:
-                    plan.approvals = self._approve_and_verify(plan)
+                    approvals = self._approve_and_verify(plan)
+                    plan.approvals = approvals
+                    approvals_known = True
                     approval_count = 1
                     self.console.success(f"{prefix} 审批成功")
                 else:
                     self.console.info(f"{prefix} 当前执行账号已经审批，跳过审批")
 
-                approvals = plan.approvals
                 if approvals is None:
                     raise AutomationError(f"{prefix} 缺少审批状态")
                 if approvals.approvals_left > 0:
@@ -1845,21 +2004,44 @@ class ApprovalEngine:
                 self.console.error(message)
                 if error.detail:
                     self.console.debug(error.detail)
-                return approval_count, 0, message, None, no_received_reasons
+                return MRResult(
+                    approved_count=approval_count,
+                    error=message,
+                    no_received_reasons=no_received_reasons,
+                    approvers=self._approver_names(approvals),
+                    approvals_known=approvals_known,
+                    approved_by_own=self._approved_by_own(approvals),
+                )
             self.console.info(f"{prefix} 重新核验后确认 MR 已合并")
 
         # Count the confirmed server state, including an MR merged by someone
         # else. Receipt ownership remains a separate identity check.
         assert final_details is not None
+        if not plan.already_merged:
+            try:
+                approvals = self.glab.approvals(ref, plan.use_leader)
+                approvals_known = True
+                if approval_count:
+                    approvals.approved_by.setdefault(plan.actor.user_id, plan.actor.name)
+            except AutomationError as error:
+                self.console.warning(
+                    f"{prefix} 合并已完成，但读取最终审批人失败，保留处理中的审批记录：{error}"
+                )
+                self.console.debug(error.detail)
         self._on_merge_confirmed(final_details)
         self._record_non_own_merge(final_details, no_received_reasons)
         self.console.success(f"{prefix} 单 MR 流程完成")
-        return (
-            approval_count,
-            1,
-            None,
-            final_details.merged_by_id in self.own_user_ids,
-            no_received_reasons,
+        return MRResult(
+            approved_count=approval_count,
+            merged_count=1,
+            owned_merge=final_details.merged_by_id in self.local_user_ids,
+            receipt_eligible=final_details.merged_by_id in self.own_user_ids,
+            no_received_reasons=no_received_reasons,
+            approvers=self._approver_names(approvals),
+            approvals_known=approvals_known,
+            approved_by_own=self._approved_by_own(approvals),
+            merged_by=final_details.merged_by_name,
+            merge_owner_known=final_details.merged_by_id is not None,
         )
 
     def process(self, task: MessageTask) -> None:
@@ -1874,13 +2056,11 @@ class ApprovalEngine:
         no_received_reasons: set[str] = set()
         approval_count = 0
         merge_count = 0
-        own_merge_count = 0
+        owned_merge_count = 0
+        unknown_merge_count = 0
         errors: list[str] = []
 
-        results: dict[
-            int,
-            tuple[int, int, str | None, bool | None, set[str]],
-        ] = {}
+        results: dict[int, MRResult] = {}
         if total == 1:
             results[1] = self._process_one(task.refs[0], 1, total)
         else:
@@ -1896,20 +2076,32 @@ class ApprovalEngine:
                     results[futures[future]] = future.result()
 
         for index in range(1, total + 1):
-            approvals, merges, error, merged_by_own_account, reasons = results[index]
-            approval_count += approvals
-            merge_count += merges
-            no_received_reasons.update(reasons)
-            if merged_by_own_account is True:
-                own_merge_count += 1
-            if error is not None:
-                errors.append(error)
+            result = results[index]
+            approval_count += result.approved_count
+            merge_count += result.merged_count
+            no_received_reasons.update(result.no_received_reasons)
+            if result.merged_count and result.owned_merge:
+                owned_merge_count += 1
+            if result.merged_count and not result.owned_merge and not result.merge_owner_known:
+                unknown_merge_count += 1
+            if result.error is not None:
+                errors.append(result.error)
+
+        other_merge_count = max(0, merge_count - owned_merge_count - unknown_merge_count)
+        summary = (
+            f"共 {total} 个 MR：本次本机审批 {approval_count} 个，"
+            f"已合并 {merge_count} 个"
+        )
+        if merge_count:
+            summary += (
+                f"（本机合并 {owned_merge_count} 个，其他成员合并 {other_merge_count} 个"
+            )
+            if unknown_merge_count:
+                summary += f"，合并人未知 {unknown_merge_count} 个"
+            summary += "）"
 
         if errors:
-            summary = (
-                f"共 {total} 个 MR：审批 {approval_count} 个，合并 {merge_count} 个；"
-                f"{len(errors)} 个 MR 处理失败，未点击“收到”"
-            )
+            summary += f"；{len(errors)} 个 MR 处理失败，未点击“收到”"
             self.console.warning(summary)
             for error in errors:
                 self.console.warning(f"失败明细：{error}")
@@ -1920,7 +2112,7 @@ class ApprovalEngine:
             )
             return
 
-        if own_merge_count == 0:
+        if not any(result.receipt_eligible for result in results.values()):
             reason = "；".join(sorted(no_received_reasons)) or "所有 MR 均由其他人员合并"
             self.console.warning(
                 "全部 MR 均已合并，但没有任何 MR 由当前账号合并，"
@@ -1938,10 +2130,7 @@ class ApprovalEngine:
         try:
             self.dws.add_received(task.conversation_id, task.message_id)
         except AutomationError as error:
-            message = (
-                f"{total} 个 MR 已完成：审批 {approval_count} 个，合并 {merge_count} 个；"
-                f"但添加“收到”失败：{error}"
-            )
+            message = f"{summary}；但添加“收到”失败：{error}"
             self.console.error(message)
             self.notifier.send(
                 "代码审批已完成但收到失败",
@@ -1952,7 +2141,7 @@ class ApprovalEngine:
         self.console.success("已给原钉钉消息添加“👌 收到”表态")
         self.notifier.send(
             "代码审批处理完成",
-            f"{total} 个 MR 已完成：审批 {approval_count} 个，合并 {merge_count} 个，并已点击“收到”",
+            f"{summary}，并已点击“收到”",
             subtitle=f"发送人：{task.sender_name}",
         )
 
@@ -2043,7 +2232,7 @@ class ListenerRuntime:
         except AutomationError as error:
             self.console.error(str(error))
             return
-        if not self.recent_messages.add_if_new(key):
+        if self.recent_messages.contains(key):
             self.console.debug("忽略当前进程内重复投递的消息")
             return
 
@@ -2108,6 +2297,9 @@ class ListenerRuntime:
                 subtitle=f"发送人：{sender_name}",
             )
             return
+        if not self.recent_messages.add_if_new(key):
+            self._release(refs)
+            return
 
         task = MessageTask(
             event_key=key,
@@ -2120,6 +2312,7 @@ class ListenerRuntime:
             self.tasks.put_nowait(task)
         except queue.Full:
             self._release(refs)
+            self.recent_messages.forget(key)
             self.console.error("审批队列已满，本条消息未执行")
             self.notifier.send(
                 "代码审批队列已满",

@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 
 struct AppSettings: Codable, Equatable {
+    static let currentSchemaVersion = 1
     var schemaVersion = 1
     var profile = ""
     var approvalGroup = "代码审批"
@@ -62,7 +63,13 @@ struct AppSettings: Codable, Equatable {
         let combined = AppSettings().dictionary().merging(dictionary) { _, new in new }
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let settings = try decoder.decode(AppSettings.self, from: JSONSerialization.data(withJSONObject: combined))
+        var settings = try decoder.decode(AppSettings.self, from: JSONSerialization.data(withJSONObject: combined))
+        guard settings.schemaVersion == AppSettings.currentSchemaVersion else {
+            throw NSError(domain: "ApprovalDesk", code: 3, userInfo: [NSLocalizedDescriptionKey: "配置文件版本与当前应用不一致，请检查版本或迁移配置"])
+        }
+        // The current schema is still v1. Keeping the field and this guard
+        // makes future migrations explicit instead of silently accepting them.
+        settings.schemaVersion = AppSettings.currentSchemaVersion
         if let issue = settings.validationIssue {
             throw NSError(domain: "ApprovalDesk", code: 2, userInfo: [NSLocalizedDescriptionKey: issue])
         }
@@ -76,6 +83,7 @@ struct AppSettings: Codable, Equatable {
         try Self.encoder.encode(self).write(to: url, options: .atomic)
     }
     var validationIssue: String? {
+        if schemaVersion != AppSettings.currentSchemaVersion { return "配置版本与当前应用不一致" }
         let options: [(String, Set<String>)] = [
             (lockedMessagePolicy, ["queue", "discard"]), (pausedMessagePolicy, ["queue", "discard"]),
             (queueOverflowPolicy, ["reject_new", "drop_oldest"]),
@@ -169,6 +177,7 @@ struct MRItem: Identifiable, Equatable {
     var url: String
     var title = ""
     var status = "waiting"
+    var stage = ""
     var sourceBranch = ""
     var targetBranch = ""
     var changesCount = ""
@@ -180,11 +189,23 @@ struct MRItem: Identifiable, Equatable {
     var error = ""
     var elapsed: Double = 0
     var approved = false
+    var approvers: [String] = []
+    var approvalsKnown = false
+    var approvedByOwn = false
     var ownedMerge = false
+    var mergeOwnerKnown = false
     var createdAt = ""
     var updatedAt = ""
+    var approvalSummary: String {
+        if !approvalsKnown { return "审批：审批人未获取" }
+        if approvers.isEmpty { return "审批：GitLab 未返回审批人" }
+        let names = approvers.joined(separator: "、")
+        return approvedByOwn ? "审批：\(names) · 含本机" : "审批：\(names) · 均非本机"
+    }
     var mergeSummary: String {
-        mergedBy.isEmpty ? "已合并 · GitLab 未返回合并人" : "已由 \(mergedBy) 合并"
+        guard !mergedBy.isEmpty else { return "合并：GitLab 未返回合并人" }
+        guard mergeOwnerKnown else { return "合并：\(mergedBy) · 归属未知" }
+        return ownedMerge ? "合并：\(mergedBy) · 本机" : "合并：\(mergedBy) · 其他成员"
     }
 
     init(_ data: [String: Any]) {
@@ -196,6 +217,7 @@ struct MRItem: Identifiable, Equatable {
         if let v = data["url"] as? String, !v.isEmpty { url = v }
         if let v = data["title"] as? String { title = v }
         if let v = data["status"] as? String { status = v }
+        if let v = data["stage"] as? String { stage = v }
         if let v = data["source_branch"] as? String { sourceBranch = v }
         if let v = data["target_branch"] as? String { targetBranch = v }
         if let v = data["changes_count"] as? String { changesCount = v }
@@ -207,7 +229,11 @@ struct MRItem: Identifiable, Equatable {
         if let v = data["error"] as? String { error = v }
         if let v = data["elapsed"] as? Double { elapsed = v }
         if let v = data["approved"] as? Bool { approved = v }
+        if let v = data["approvers"] as? [String] { approvers = v }
+        if let v = data["approvals_known"] as? Bool { approvalsKnown = v }
+        if let v = data["approved_by_own"] as? Bool { approvedByOwn = v }
         if let v = data["owned_merge"] as? Bool { ownedMerge = v }
+        if let v = data["merge_owner_known"] as? Bool { mergeOwnerKnown = v }
         if let v = data["created_at"] as? String { createdAt = v }
         if let v = data["updated_at"] as? String { updatedAt = v }
     }
@@ -220,6 +246,7 @@ struct ApprovalTask: Identifiable, Equatable {
     var receivedAt: Date
     var status = "queued"
     var content = ""
+    var conversationTitle = ""
     var summary = ""
     var error = ""
     var mrs: [MRItem] = []
@@ -228,12 +255,16 @@ struct ApprovalTask: Identifiable, Equatable {
     var elapsed: Double = 0
     var approvedCount = 0
     var mergedCount = 0
+    var ownedMergeCount = 0
+    var otherMergeCount = 0
+    var unknownMergeCount = 0
 
     init(_ data: [String: Any]) {
         id = data["id"] as? String ?? UUID().uuidString
         sender = data["sender"] as? String ?? "未知发送人"
         receivedAt = Date(timeIntervalSince1970: data["received_at"] as? Double ?? Date().timeIntervalSince1970)
         content = data["content"] as? String ?? ""
+        conversationTitle = data["conversation_title"] as? String ?? ""
         mrs = (data["mrs"] as? [[String: Any]] ?? []).map(MRItem.init)
         quoted = data["quoted"] as? Bool ?? false
         merge(data)
@@ -241,12 +272,16 @@ struct ApprovalTask: Identifiable, Equatable {
     mutating func merge(_ data: [String: Any]) {
         if let v = data["sender_avatar_url"] as? String { senderAvatarURL = v }
         if let v = data["status"] as? String { status = v }
+        if let v = data["conversation_title"] as? String { conversationTitle = v }
         if let v = data["summary"] as? String { summary = v }
         if let v = data["error"] as? String { error = v }
         if let v = data["received"] as? Bool { received = v }
         if let v = data["elapsed"] as? Double { elapsed = v }
         if let v = data["approved_count"] as? Int { approvedCount = v }
         if let v = data["merged_count"] as? Int { mergedCount = v }
+        if let v = data["owned_merge_count"] as? Int { ownedMergeCount = v }
+        if let v = data["other_merge_count"] as? Int { otherMergeCount = v }
+        if let v = data["unknown_merge_count"] as? Int { unknownMergeCount = v }
     }
     var hasErrors: Bool { ["failed", "partial", "invalid"].contains(status) }
     var waiting: Bool { status == "queued" }
@@ -292,7 +327,11 @@ enum TaskFilter: String, CaseIterable, Identifiable {
         switch self { case .all: "tray.full"; case .queued: "clock"; case .completed: "checkmark.circle" }
     }
     func includes(_ task: ApprovalTask) -> Bool {
-        switch self { case .all: true; case .queued: task.waiting || task.running; case .completed: task.status == "completed" }
+        switch self {
+        case .all: true
+        case .queued: task.waiting || task.running
+        case .completed: ["completed", "partial"].contains(task.status)
+        }
     }
 }
 

@@ -12,6 +12,7 @@ import listener_core as core
 from configuration import DEFAULTS, configure_core, validate
 from protocol import Events, EventConsole, EventNotifier
 from runtime import ApplicationEngine, ApplicationRuntime, PolicyGate
+import worker as worker_module
 
 
 class DwsFake:
@@ -84,6 +85,36 @@ class PolicyTests(unittest.TestCase):
                 self.avatar_lookup.assert_not_called()
                 self.assertEqual(self.output[-1]["task"]["status"], "discarded")
 
+    def test_discarded_message_can_be_delivered_again_after_resume(self):
+        self.gate.paused.set()
+        runtime = self.runtime()
+        runtime._handle_event(self.event())
+        self.assertEqual(runtime.tasks.qsize(), 0)
+        self.gate.paused.clear()
+        runtime._handle_event(self.event())
+        self.assertEqual(runtime.tasks.qsize(), 1)
+
+    def test_rejected_message_can_be_retried_after_queue_space_is_freed(self):
+        self.settings.update(queue_capacity=1, queue_overflow_policy="reject_new")
+        runtime = self.runtime()
+        runtime._handle_event(self.event(1))
+        runtime._handle_event(self.event(2))
+        self.assertEqual(runtime.clear_queue(), 1)
+        runtime._handle_event(self.event(2))
+        self.assertEqual(runtime.tasks.get_nowait().message_id, "message-2")
+
+    def test_cleared_message_can_be_delivered_again(self):
+        runtime = self.runtime()
+        runtime._handle_event(self.event())
+        runtime.clear_queue()
+        runtime._handle_event(self.event())
+        self.assertEqual(runtime.tasks.get_nowait().message_id, "message-1")
+
+    def test_direct_message_does_not_look_up_quoted_content(self):
+        runtime = self.runtime()
+        runtime._handle_event(self.event())
+        self.assertEqual(self.dws.lookups, [])
+
     def test_avatar_loading_does_not_delay_queue_and_only_updates_its_request(self):
         entered, release, published = threading.Event(), threading.Event(), threading.Event()
         def lookup(*_):
@@ -129,6 +160,38 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(self.dws.reads, ["message-1"])
         finally:
             self.stop.set(); runtime.tasks.put(None); thread.join(2)
+        self.assertFalse(thread.is_alive())
+
+    def test_mark_read_does_not_block_gitlab_processing(self):
+        runtime = self.runtime()
+        read_started = threading.Event()
+        release_read = threading.Event()
+        processed = threading.Event()
+
+        def slow_mark_read(_conversation, message):
+            read_started.set()
+            release_read.wait(3)
+            self.dws.reads.append(message)
+
+        self.dws.mark_read = slow_mark_read
+        self.engine.process.side_effect = lambda task: processed.set()
+        runtime._start_mark_read_worker()
+        runtime._handle_event(self.event())
+        thread = threading.Thread(target=runtime._worker)
+        thread.start()
+        try:
+            self.assertTrue(read_started.wait(2))
+            self.assertTrue(processed.wait(2))
+            self.assertEqual(self.engine.process.call_count, 1)
+            self.assertFalse(release_read.is_set())
+        finally:
+            self.stop.set()
+            release_read.set()
+            runtime.tasks.put(None, timeout=2)
+            thread.join(2)
+            runtime._mark_read_tasks.put(None, timeout=2)
+            if runtime._mark_read_thread is not None:
+                runtime._mark_read_thread.join(2)
         self.assertFalse(thread.is_alive())
 
     def test_reject_new_preserves_existing_queue(self):
@@ -223,7 +286,17 @@ class ReceiptTests(unittest.TestCase):
         engine = ApplicationEngine(Mock(), dws, core.Identity(1, "本人", "me"), None,
                                    console, EventNotifier(events, lambda: settings), gate, stop,
                                    settings=settings, events=events)
-        engine._process_one = lambda ref, index, total: results[index - 1]
+        def result(value):
+            approvals, merges, error, owned, reasons = value
+            return core.MRResult(
+                approved_count=approvals,
+                merged_count=merges,
+                error=error,
+                owned_merge=bool(merges and owned),
+                receipt_eligible=bool(owned),
+                no_received_reasons=set(reasons),
+            )
+        engine._process_one = lambda ref, index, total: result(results[index - 1])
         refs = tuple(core.parse_mr_url(f"https://git2.superboss.cc/erp/erp-core/-/merge_requests/{n + 1}") for n in range(len(results)))
         engine.process(core.MessageTask("event", "message", "group", "成员", refs))
         return dws, output
@@ -272,6 +345,25 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaises(core.AutomationError): core.retry_operation(operation, console=EventConsole(Events(lambda e: None)), description="测试")
             self.assertEqual(len(calls), 1)
         finally: configure_core(DEFAULTS)
+
+    def test_configuration_schema_must_match_current(self):
+        for version in (0, True, DEFAULTS["schema_version"] + 1):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                validate({"schema_version": version})
+
+    def test_control_commands_acknowledge_completion(self):
+        output = []
+        controller = worker_module.Controller(Events(output.append))
+        runtime = Mock()
+        runtime.clear_queue.return_value = 3
+        controller.runtime = runtime
+        for command in ("clear_queue", "pause", "resume", "stop"):
+            controller.dispatch({"command": command, "request_id": command + "-id"})
+        acks = [event for event in output if event.get("type") == "command_ack"]
+        self.assertEqual([event["command"] for event in acks], ["clear_queue", "pause", "resume"])
+        self.assertEqual(acks[0]["count"], 3)
+        self.assertEqual(acks[0]["request_id"], "clear_queue-id")
+        runtime.request_stop.assert_called_once()
 
     def test_worker_protocol_exits_cleanly_without_external_calls(self):
         worker = Path(__file__).resolve().parents[2] / "Engine/worker.py"

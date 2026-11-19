@@ -22,12 +22,14 @@ private final class StartupProbeConnection: EngineConnection {
         engine.onExit = { [weak self] in self?.onExit?() }
     }
     func launch(dataDirectory: URL) throws { try engine.launch(dataDirectory: dataDirectory) }
-    func send(_ command: String, settings: AppSettings?, values: [String: Any]) {
+    @discardableResult
+    func send(_ command: String, settings: AppSettings?, values: [String: Any]) -> Bool {
         precondition(["configure", "accounts", "profiles", "groups"].contains(command), "Startup probe received unexpected command: \(command)")
         commands.append(command)
-        engine.send(command, settings: settings, values: values)
+        return engine.send(command, settings: settings, values: values)
     }
     func shutdown() { engine.shutdown() }
+    func terminate() { engine.terminate() }
 }
 
 @main

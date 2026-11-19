@@ -1,7 +1,10 @@
 from dataclasses import replace
 from pathlib import Path
+import json
+import subprocess
 import sys
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -18,10 +21,15 @@ class GitLabFake:
         self.calls = []
         self.items = {}
         self.approved = set()
+        self.approvers = {}
         self.commit_counts = {}
         self.lost_merge_response = False
+        self.return_merge_details = False
         self.changed_sha = False
         self.preflight_barrier = None
+        self.details_errors = set()
+        self.approve_errors = set()
+        self.merge_errors = set()
         self.seen = set()
         self.lock = threading.Lock()
 
@@ -37,6 +45,8 @@ class GitLabFake:
             first = ref.iid not in self.seen
             self.seen.add(ref.iid)
             self.calls.append(("details", ref.iid))
+        if ref.iid in self.details_errors:
+            raise RuntimeError("preflight exploded")
         if first and self.preflight_barrier and ref.iid <= 2:
             self.preflight_barrier.wait(timeout=2)
         return replace(self.items[ref.iid])
@@ -50,14 +60,23 @@ class GitLabFake:
         self.calls.append(("approvals", ref.iid, use_leader))
         done = ref.iid in self.approved
         actor = 2 if use_leader else 1
-        return core.ApprovalInfo(1, 0 if done else 1, done, True, {actor: "本人"} if done else {})
+        names = dict(self.approvers.get(ref.iid, {}))
+        if done:
+            names[actor] = "本人"
+        return core.ApprovalInfo(1, 0 if done else 1, done, True, names)
 
     def approve(self, ref, sha, use_leader=False):
         self.calls.append(("approve", ref.iid, sha, use_leader))
+        if ref.iid in self.approve_errors:
+            raise RuntimeError("approval exploded")
         self.approved.add(ref.iid)
 
     def merge(self, ref, sha, use_leader=False):
         self.calls.append(("merge", ref.iid, sha, use_leader))
+        if ref.iid in self.merge_errors:
+            raise RuntimeError("merge exploded")
+        if self.items[ref.iid].state == "merged":
+            raise core.AutomationError("合并请求已经被其他成员合并")
         if self.changed_sha:
             self.items[ref.iid].sha = "sha-new"
             raise core.AutomationError("version changed", retryable=True)
@@ -66,6 +85,9 @@ class GitLabFake:
         self.items[ref.iid].merged_by_name = "备用账号" if use_leader else "本人"
         if self.lost_merge_response:
             raise core.AutomationError("connection reset", retryable=True)
+        if self.return_merge_details:
+            return replace(self.items[ref.iid])
+        return None
 
 
 class ExecutionTests(unittest.TestCase):
@@ -108,11 +130,64 @@ class ExecutionTests(unittest.TestCase):
 
     def test_full_sequence_approves_and_merges_the_checked_sha(self):
         result = self.process(self.glab.add())
-        self.assertEqual(self.glab.calls, [("details", 1), ("commits", 1), ("approvals", 1, False),
-                                          ("approve", 1, "sha-original", False), ("approvals", 1, False),
-                                          ("details", 1), ("merge", 1, "sha-original", False), ("details", 1)])
+        self.assertEqual(self.glab.calls[:6], [
+            ("details", 1), ("approvals", 1, False),
+            ("approve", 1, "sha-original", False),
+            ("merge", 1, "sha-original", False),
+            ("details", 1), ("approvals", 1, False),
+        ])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(self.receipts, ["message"])
+
+    def test_display_only_commit_count_runs_after_merge(self):
+        ref = self.glab.add()
+        self.process(ref)
+        merge_index = next(index for index, call in enumerate(self.glab.calls) if call[0] == "merge")
+        deadline = time.monotonic() + 2
+        while not any(call[0] == "commits" for call in self.glab.calls) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        commit_index = next(index for index, call in enumerate(self.glab.calls) if call[0] == "commits")
+        self.assertGreater(commit_index, merge_index)
+        deadline = time.monotonic() + 2
+        while "commit_count" not in self.mr_state(ref) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.mr_state(ref)["commit_count"], 2)
+
+    def test_merge_response_avoids_the_post_merge_detail_request(self):
+        self.glab.return_merge_details = True
+        ref = self.glab.add()
+        result = self.process(ref)
+        self.assertEqual(result["status"], "completed")
+        merge_index = next(index for index, call in enumerate(self.glab.calls) if call[0] == "merge")
+        self.assertFalse(any(call[0] == "details" for call in self.glab.calls[merge_index + 1:]))
+        self.assertEqual(self.mr_state(ref)["merged_by"], "本人")
+
+    def test_background_commit_count_stays_attached_to_its_original_task(self):
+        self.glab.return_merge_details = True
+        entered, release = threading.Event(), threading.Event()
+        original = self.glab.commit_count
+        def slow_commit_count(ref):
+            entered.set()
+            release.wait(2)
+            return original(ref)
+        with patch.object(self.glab, "commit_count", side_effect=slow_commit_count):
+            self.process(self.glab.add())
+            self.assertTrue(entered.wait(2))
+            self.engine.task_id = "another-event"
+            release.set()
+            deadline = time.monotonic() + 2
+            while not any(event.get("commit_count") == 2 for event in self.events) and time.monotonic() < deadline:
+                time.sleep(0.01)
+        update = next(event for event in self.events if event.get("commit_count") == 2)
+        self.assertEqual(update["task_id"], "event")
+
+    def test_approval_names_include_other_people_and_local_actor(self):
+        ref = self.glab.add()
+        self.glab.approvers[1] = {20: "张三"}
+        self.process(ref)
+        mr = self.mr_state(ref)
+        self.assertEqual(mr["approvers"], ["张三", "本人"])
+        self.assertTrue(mr["approved_by_own"])
 
     def test_mr_details_publish_the_server_link_to_the_native_ui(self):
         ref = self.glab.add()
@@ -141,12 +216,17 @@ class ExecutionTests(unittest.TestCase):
 
     def test_already_merged_by_other_person_has_no_writes_or_receipt(self):
         ref = self.glab.add(state="merged", merged_by_id=20, merged_by_name="同事")
+        self.glab.approvers[1] = {20: "张三"}
         result = self.process(ref)
         self.assertFalse(any(c[0] in {"approve", "merge"} for c in self.glab.calls))
         self.assertEqual(self.receipts, [])
         self.assertEqual(result["merged_count"], 1)
-        self.assertEqual(self.mr_state(ref)["merged_by"], "同事")
-        self.assertEqual(self.mr_state(ref)["status"], "completed")
+        mr = self.mr_state(ref)
+        self.assertEqual(mr["merged_by"], "同事")
+        self.assertEqual(mr["approvers"], ["张三"])
+        self.assertFalse(mr["approved_by_own"])
+        self.assertTrue(mr["approvals_known"])
+        self.assertEqual(mr["status"], "completed")
 
     def test_merge_405_confirmed_merged_by_other_person_completes_without_receipt(self):
         ref = self.glab.add()
@@ -163,7 +243,12 @@ class ExecutionTests(unittest.TestCase):
         mr = self.mr_state(ref)
         self.assertEqual((mr["status"], mr["merged_by"], mr["error"]), ("completed", "协作成员", ""))
         self.assertEqual(mr["actor"], "本人")
+        self.assertEqual(mr["approvers"], ["本人"])
+        self.assertTrue(mr["approved_by_own"])
         self.assertFalse(mr["owned_merge"])
+        self.assertEqual(result["owned_merge_count"], 0)
+        self.assertEqual(result["other_merge_count"], 1)
+        self.assertIn("本机合并 0 个，其他成员合并 1 个", result["summary"])
         self.assertEqual(self.receipts, [])
 
     def test_default_receipt_accepts_own_merge_plus_confirmed_other_merge(self):
@@ -285,9 +370,11 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(self.mr_state(ref)["merged_by"], "")
         self.assertFalse(self.mr_state(ref)["owned_merge"])
+        self.assertEqual(result["unknown_merge_count"], 1)
+        self.assertEqual(result["other_merge_count"], 0)
         self.assertEqual(self.receipts, [])
 
-    def test_merge_during_approval_is_detected_before_the_merge_write(self):
+    def test_merge_during_approval_is_reconciled_from_the_rejected_write(self):
         ref = self.glab.add()
         approve = self.glab.approve
         def finish(ref, sha, use_leader=False):
@@ -296,7 +383,7 @@ class ExecutionTests(unittest.TestCase):
         with patch.object(self.glab, "approve", side_effect=finish):
             result = self.process(ref)
         self.assertEqual(result["status"], "completed")
-        self.assertFalse(any(call[0] == "merge" for call in self.glab.calls))
+        self.assertEqual(len([call for call in self.glab.calls if call[0] == "merge"]), 1)
         self.assertEqual(self.mr_state(ref)["merged_by"], "协作成员")
         self.assertEqual(self.receipts, [])
 
@@ -325,8 +412,44 @@ class ExecutionTests(unittest.TestCase):
     def test_stopped_task_does_not_start_gitlab_calls(self):
         ref = self.glab.add()
         self.stop.set()
-        with self.assertRaises(core.ProcessingStopped): self.process(ref)
+        result = self.process(ref)
         self.assertEqual(self.glab.calls, [])
+        self.assertEqual(self.receipts, [])
+        self.assertEqual(result["status"], "stopped")
+        self.assertIn("1 个未完成", result["summary"])
+        self.assertEqual(self.mr_state(ref)["status"], "stopped")
+
+    def test_unexpected_mr_failure_does_not_abort_other_mrs(self):
+        failed = self.glab.add(1)
+        completed = self.glab.add(2)
+        self.glab.details_errors.add(1)
+        result = self.process(failed, completed)
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["merged_count"], 1)
+        self.assertIn("preflight exploded", result["error"])
+        self.assertEqual(self.mr_state(failed)["status"], "failed")
+        self.assertEqual(self.mr_state(failed)["stage"], "preflight")
+        self.assertEqual(self.mr_state(completed)["status"], "completed")
+        self.assertFalse(any(call[1] == 1 and call[0] in {"approve", "merge"} for call in self.glab.calls))
+
+    def test_approval_failure_publishes_approval_stage(self):
+        ref = self.glab.add()
+        self.glab.approve_errors.add(1)
+        result = self.process(ref)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(self.mr_state(ref)["status"], "failed")
+        self.assertEqual(self.mr_state(ref)["stage"], "approval")
+        self.assertFalse(any(call[0] == "merge" for call in self.glab.calls))
+
+    def test_merge_failure_publishes_merge_stage(self):
+        ref = self.glab.add()
+        self.glab.merge_errors.add(1)
+        result = self.process(ref)
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["approved_count"], 1)
+        self.assertEqual(self.mr_state(ref)["status"], "failed")
+        self.assertEqual(self.mr_state(ref)["stage"], "merge")
+        self.assertTrue(any(call[0] == "approve" for call in self.glab.calls))
 
     def test_dingtalk_retry_rechecks_pause_before_each_write(self):
         dws = AppDws("/unused/dws", self.console, self.settings)
@@ -337,6 +460,45 @@ class ExecutionTests(unittest.TestCase):
             with self.assertRaises(core.ProcessingStopped): dws.mark_read("group", "message")
             self.assertEqual(command.call_count, 1)
             self.assertEqual(dws.gate.wait_until_unlocked.call_count, 2)
+
+
+class GlabCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.client = core.GlabClient("glab", Mock(), "git2.superboss.cc")
+        self.ref = core.parse_mr_url(
+            "https://git2.superboss.cc/erp/core/-/merge_requests/7"
+        )
+
+    def test_approve_uses_the_gitlab_approval_api_directly(self):
+        completed = subprocess.CompletedProcess([], 0, "{}", "")
+        with patch.object(core, "run_command", return_value=completed) as command:
+            self.client.approve(self.ref, "sha-checked", False)
+        args = command.call_args.args[0]
+        self.assertIn("api", args)
+        self.assertTrue(any(part.endswith("/merge_requests/7/approve") for part in args))
+        self.assertIn("POST", args)
+        self.assertIn("sha=sha-checked", args)
+        self.assertNotIn("mr", args)
+
+    def test_merge_response_can_confirm_the_final_merger_without_a_second_read(self):
+        payload = {
+            "state": "merged",
+            "sha": "sha-checked",
+            "title": "测试修改",
+            "author": {"id": 20, "name": "作者", "username": "author"},
+            "merge_user": {"id": 30, "name": "王五", "username": "wangwu"},
+            "source_branch": "feature/a",
+            "target_branch": "main",
+            "changes_count": "2",
+            "web_url": "https://git2.superboss.cc/erp/core/merge_requests/7",
+        }
+        completed = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+        with patch.object(core, "run_command", return_value=completed):
+            details = self.client.merge(self.ref, "sha-checked", False)
+        self.assertIsNotNone(details)
+        assert details is not None
+        self.assertEqual(details.state, "merged")
+        self.assertEqual((details.merged_by_id, details.merged_by_name), (30, "王五"))
 
 
 if __name__ == "__main__": unittest.main()

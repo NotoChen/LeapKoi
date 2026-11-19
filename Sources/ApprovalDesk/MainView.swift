@@ -220,7 +220,7 @@ struct TaskDetailView: View {
                         HStack(spacing: 7) {
                             Text(task.receivedAt, format: .dateTime.month().day().hour().minute())
                             Text("·")
-                            Text(model.settings.approvalGroup)
+                            Text(task.conversationTitle.isEmpty ? model.settings.approvalGroup : task.conversationTitle)
                             if task.quoted { Text("· 引用消息") }
                         }.font(.system(size: 10)).foregroundStyle(.secondary)
                     }
@@ -277,7 +277,17 @@ struct TaskDetailView: View {
 struct MRCard: View {
     let mr: MRItem
     let isDemo: Bool
-    var phase: Int { ["waiting": -1, "preflight": 0, "approving": 1, "merging": 2, "completed": 3, "failed": mr.approved ? 2 : 0][mr.status] ?? -1 }
+    var phase: Int {
+        if mr.status == "failed" {
+            switch mr.stage {
+            case "approval": return 1
+            case "merge": return 2
+            default: return 0
+            }
+        }
+        return ["waiting": -1, "preflight": 0, "approving": 1, "merging": 2,
+                "completed": 3, "stopped": -1][mr.status] ?? -1
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 15) {
             HStack(alignment: .top) {
@@ -302,7 +312,9 @@ struct MRCard: View {
                 HStack(spacing: 18) {
                     meta("变更文件", mr.changesCount)
                     meta("提交", mr.commitCount.map(String.init) ?? "未知")
-                    meta("执行账号", mr.actor.isEmpty ? "待确认" : mr.actor)
+                    if !mr.actor.isEmpty {
+                        meta("本机审批账号", mr.actor)
+                    }
                     Spacer(minLength: 0)
                 }
             }
@@ -320,12 +332,25 @@ struct MRCard: View {
             if !mr.error.isEmpty {
                 Text(mr.error).font(.system(size: 11)).foregroundStyle(.red.opacity(0.9)).textSelection(.enabled).padding(10).frame(maxWidth: .infinity, alignment: .leading).background(Color.red.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
             }
-            if mr.status == "completed" {
+            if mr.status == "completed" || mr.approvalsKnown {
+                VStack(alignment: .leading, spacing: 7) {
+                    Label(mr.approvalSummary, systemImage: "person.2")
+                    if mr.status == "completed" || !mr.mergedBy.isEmpty {
+                        Label(mr.mergeSummary, systemImage: "arrow.triangle.merge")
+                    }
+                }
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
+            }
+            if mr.status == "completed", mr.elapsed > 0 {
                 HStack {
-                    Text(mr.mergeSummary)
                     Spacer()
-                    if mr.elapsed > 0 { Text(String(format: "%.1f 秒", mr.elapsed)).monospacedDigit() }
-                }.font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text(String(format: "%.1f 秒", mr.elapsed)).monospacedDigit()
+                }.font(.system(size: 10)).foregroundStyle(.tertiary)
             }
         }.padding(18).contentSurface()
     }
