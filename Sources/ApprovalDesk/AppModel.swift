@@ -474,6 +474,14 @@ final class AppModel: ObservableObject {
         workerRestartTask?.cancel(); workerRestartTask = nil
         workerHealthTask?.cancel(); workerHealthTask = nil
         operationTimeoutTask?.cancel(); operationTimeoutTask = nil
+        if currentOperation == "start", status == "starting" {
+            currentOperation = nil
+            startRequestID = nil
+            listeningConfiguration = nil
+        }
+        if ["start", "auto_start"].contains(pendingAfterLaunch ?? "") {
+            pendingAfterLaunch = nil
+        }
         guard client.isRunning else {
             status = "stopped"; connected = false; paused = false
             activeCount = 0; queueCount = 0; errorMessage = nil

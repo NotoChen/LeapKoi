@@ -247,15 +247,15 @@ struct TaskDetailView: View {
                         .font(.system(size: 12)).foregroundStyle(.secondary)
                     if !task.error.isEmpty { Text(task.error).font(.system(size: 12)).foregroundStyle(.red).textSelection(.enabled) }
                 }
-                if !task.mrSummaries.isEmpty {
+                if !task.resolvedMRSummaries.isEmpty {
                     VStack(alignment: .leading, spacing: 9) {
                         HStack {
                             Text("逐个 MR 结果").font(.system(size: 12, weight: .semibold))
                             Spacer()
                             Text("按实际账号归属").font(.system(size: 10)).foregroundStyle(.tertiary)
                         }
-                        ForEach(task.mrSummaries.indices, id: \.self) { index in
-                            Text(task.mrSummaries[index])
+                        ForEach(task.resolvedMRSummaries.indices, id: \.self) { index in
+                            Text(task.resolvedMRSummaries[index])
                                 .font(.system(size: 11))
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
@@ -331,6 +331,9 @@ struct MRCard: View {
                 HStack(spacing: 18) {
                     meta("变更文件", mr.changesCount)
                     meta("提交", mr.commitCount.map(String.init) ?? "未知")
+                    if !mr.author.isEmpty {
+                        meta("作者", mr.author)
+                    }
                     if !mr.actor.isEmpty {
                         meta("本机审批账号", mr.actor)
                     }

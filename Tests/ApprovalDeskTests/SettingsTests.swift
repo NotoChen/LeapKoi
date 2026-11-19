@@ -152,6 +152,9 @@ final class SettingsTests: XCTestCase {
         let mr = MRItem(["key": "project!1", "status": "completed", "actor": "当前账号"])
         XCTAssertEqual(mr.mergeSummary, "合并人：GitLab 未返回")
         XCTAssertEqual(mr.ownedMerge, false)
+        let knownOther = MRItem(["key": "project!1", "status": "completed", "merged_by": "",
+                                 "merge_owner_known": true, "owned_merge": false])
+        XCTAssertEqual(knownOther.mergeSummary, "合并人：其他成员（GitLab 未返回姓名）")
     }
 
     func testApprovalParticipantsDistinguishLocalAndOtherMembers() {
@@ -185,6 +188,26 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(task.otherMergeCount, 1)
         XCTAssertEqual(task.unknownMergeCount, 1)
     }
+
+    func testMRSummaryFollowsBackgroundApproverRefresh() {
+        var task = ApprovalTask([
+            "id": "task", "sender": "测试",
+            "mrs": [[
+                "key": "project!1", "status": "completed", "merged_by": "协作成员",
+                "merge_owner_known": true, "owned_merge": false,
+                "approvers": ["张三"], "approvals_known": true, "approved_by_own": false,
+            ]],
+        ])
+        XCTAssertEqual(
+            task.resolvedMRSummaries,
+            ["project!1：审批人 张三（其他成员）；合并人 协作成员（其他成员）"]
+        )
+        task.mrs[0].merge(["approvers": ["张三", "当前账号"], "approved_by_own": true])
+        XCTAssertEqual(
+            task.resolvedMRSummaries,
+            ["project!1：审批人 张三、当前账号（本机参与）；合并人 协作成员（其他成员）"]
+        )
+    }
 }
 
 #if !canImport(XCTest)
@@ -205,7 +228,8 @@ final class SettingsTests: XCTestCase {
         tests.testApprovalParticipantsDistinguishLocalAndOtherMembers()
         tests.testApprovalAndMergeIdentityUnknownStatesAreExplicit()
         tests.testTaskUpdateKeepsSeparateMergeCounts()
-        print("14 native model checks passed")
+        tests.testMRSummaryFollowsBackgroundApproverRefresh()
+        print("15 native model checks passed")
         try await AvatarTests().testListAndDetailShareTheDownloadedImage()
         try await AvatarTests().testMissingOrInvalidImageReturnsThePlaceholderState()
         AvatarTests().testAvatarHostAllowlistRejectsUnsafeURLs()
@@ -231,6 +255,7 @@ final class SettingsTests: XCTestCase {
         try await app.testUnexpectedWorkerExitRestartsEngineWithoutStartingListener()
         try await app.testManualStopDoesNotRestartAnExitedWorker()
         try await app.testStopDuringStartupDoesNotRestartAnExitedWorker()
+        try app.testStopDuringStartupReleasesBusyStateAndPendingAutoStart()
         try await app.testWorkerExitAfterListeningStoppedDoesNotRestart()
         try await app.testWorkerRestartResumesAnActiveListener()
         try await app.testWorkerRestartPreservesPendingCheckWithoutStartingListener()
@@ -241,7 +266,7 @@ final class SettingsTests: XCTestCase {
         try app.testRejectedGroupSendDoesNotLeaveTheModelBusy()
         try app.testPendingTextEditIsFlushedBeforeGroupSearch()
         try app.testCompletedCountIncludesPartialTasks()
-        print("30 native startup, login-item and account checks passed")
+        print("31 native startup, login-item and account checks passed")
         try app.testBothGroupSelectorsDisplayCandidatesAndSaveTheSelectedGroup()
         try app.testFailedGroupSearchCanBeRetriedAndAnEmptyResultEndsLoading()
         try app.testGroupSelectionWhileActiveSavesForNextStartAndKeepsTasks()

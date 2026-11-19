@@ -44,6 +44,28 @@ class AvatarTests(unittest.TestCase):
         for value in (None, "", "   ", "@invalid", "https://[", {}, "file:///tmp/image.png"):
             with self.subTest(value=value): self.assertEqual(avatar_url(value), "")
 
+    def test_legacy_http_and_protocol_relative_avatars_are_upgraded(self):
+        self.assertEqual(
+            avatar_url("http://static-legacy.dingtalk.com/avatar.jpg?x=1"),
+            "https://static-legacy.dingtalk.com/avatar.jpg?x=1",
+        )
+        self.assertEqual(
+            avatar_url("//static-legacy.dingtalk.com/avatar.jpg"),
+            "https://static-legacy.dingtalk.com/avatar.jpg",
+        )
+        self.assertEqual(avatar_url("http://evil.test/avatar.jpg"), "")
+
+    def test_standard_base64_and_padding_are_accepted(self):
+        raw = b"\x94\x00\xcf" + (123456).to_bytes(8, "big") + b"\xcd\x02\x80\xcd\x02\x80"
+        encoded = base64.b64encode(raw).decode()
+        padded = encoded + "=" * (-len(encoded) % 4)
+        for value in (encoded, padded):
+            with self.subTest(value=value):
+                self.assertIn(
+                    "_640_640.jpg_128x128.jpg",
+                    avatar_url("@" + value),
+                )
+
     def test_media_id_accepts_small_dimensions_but_rejects_truncated_integers(self):
         raw = b"\x94\x00\xcd\x01\x02\x40\xcc\x80"
         media = base64.urlsafe_b64encode(raw).decode().rstrip("=")
@@ -73,9 +95,19 @@ class AvatarTests(unittest.TestCase):
     def lookup(self, rows):
         dws = core.DwsClient("/fixture/dws", Mock(), "corp:account")
         result = subprocess.CompletedProcess([], 0, json.dumps({"success": True, "result": rows}), "")
-        with patch("avatars.core.run_command", return_value=result) as call:
+        empty_contacts = subprocess.CompletedProcess([], 0, json.dumps({"success": True, "result": []}), "")
+        with patch("listener_core.run_read_command", return_value=empty_contacts), \
+                patch("avatars.core.run_command", return_value=result) as call:
             url = lookup_sender_avatar(dws, self.contact)
-            self.assertEqual(call.call_args.args[0], ["/fixture/dws", "--profile", "corp:account", "aisearch", "person", "--query", "测试成员", "--dimension", "name", "--format", "json"])
+            aisearch = next(
+                item for item in call.call_args_list
+                if "aisearch" in item.args[0]
+            )
+            self.assertEqual(aisearch.args[0], [
+                "/fixture/dws", "--profile", "corp:account",
+                "aisearch", "person", "--query", "测试成员",
+                "--dimension", "name", "--format", "json",
+            ])
             return url
 
     def test_same_name_never_substitutes_for_exact_group_member_identity(self):
@@ -84,6 +116,40 @@ class AvatarTests(unittest.TestCase):
             {"title": "测试成员", "openDingTalkId": self.contact.open_dingtalk_id, "authorAvatar": self.url},
         ]), self.url)
         self.assertEqual(self.lookup([{"title": "测试成员", "openDingTalkId": "other-person", "authorAvatar": self.url}]), "")
+
+    def test_contact_search_avatar_and_user_id_fallback_are_supported(self):
+        contact_payload = {
+            "success": True,
+            "result": [{
+                "name": self.contact.name,
+                "userId": "employee-id",
+                "openDingTalkId": self.contact.open_dingtalk_id,
+                "avatarUrl": self.url,
+            }],
+        }
+        with patch("listener_core.run_read_command",
+                   return_value=subprocess.CompletedProcess([], 0, json.dumps(contact_payload), "")) as command:
+            self.assertEqual(
+                lookup_sender_avatar(core.DwsClient("/fixture/dws", Mock(), "corp:account"), self.contact),
+                self.url,
+            )
+        self.assertEqual(command.call_args.args[0], [
+            "/fixture/dws", "--profile", "corp:account",
+            "contact", "user", "search", "--query", self.contact.name, "--format", "json",
+        ])
+
+        ai_payload = {
+            "success": True,
+            "result": [{"userId": "employee-id", "profilePhotoUrl": self.url}],
+        }
+        contact = replace(self.contact, avatar_media_id="")
+        dws = core.DwsClient("/fixture/dws", Mock(), "corp:account")
+        with patch.object(dws, "search_contacts", return_value=[
+            core.ContactCandidate(self.contact.name, "employee-id", self.contact.open_dingtalk_id,
+                                  "", "", "", ""),
+        ]), patch("avatars.core.run_command",
+                  return_value=subprocess.CompletedProcess([], 0, json.dumps(ai_payload), "")):
+            self.assertEqual(lookup_sender_avatar(dws, contact), self.url)
 
     def test_missing_and_conflicting_avatars_use_the_placeholder(self):
         self.assertEqual(self.lookup([{"openDingTalkId": self.contact.open_dingtalk_id, "authorAvatar": None}]), "")
@@ -110,6 +176,16 @@ class AvatarTests(unittest.TestCase):
             )
             call.assert_not_called()
 
+    def test_avatar_aliases_are_found_inside_nested_sender_objects(self):
+        self.assertEqual(
+            core.first_avatar_value({"sender": {"avatarUrl": self.url}}),
+            self.url,
+        )
+        self.assertEqual(
+            core.first_avatar_value({"member_info": {"avatar": {"url": self.url}}}),
+            self.url,
+        )
+
     def test_group_members_keep_the_supplied_avatar_media_id(self):
         raw = b"\x95\x02\xcf" + (123456).to_bytes(8, "big") + b"\xcd\x02\x80\xcd\x02\x80" + b"\xb0" + b"0123456789abcdef"
         media = base64.urlsafe_b64encode(raw).decode().rstrip("=")
@@ -134,6 +210,48 @@ class AvatarTests(unittest.TestCase):
             lookup_sender_avatar(dws, members[0]),
             f"https://static-legacy.dingtalk.com/media/{media}_640_640.png_128x128.jpg",
         )
+
+    def test_group_members_accept_direct_avatar_alias(self):
+        payload = {
+            "success": True,
+            "result": {
+                "hasMore": False,
+                "list": [{
+                    "memberEmpName": self.contact.name,
+                    "openDingtalkId": self.contact.open_dingtalk_id,
+                    "groupMemberAvatar": "http://static-legacy.dingtalk.com/group.jpg",
+                }],
+            },
+        }
+        completed = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+        dws = core.DwsClient("/fixture/dws", Mock(), "corp:account")
+        with patch("listener_core.run_read_command", return_value=completed):
+            members = dws.group_members("group-id", "测试群")
+        self.assertEqual(members[0].avatar_media_id, "http://static-legacy.dingtalk.com/group.jpg")
+        with patch("avatars.core.run_command") as command:
+            self.assertEqual(
+                lookup_sender_avatar(dws, members[0]),
+                "https://static-legacy.dingtalk.com/group.jpg",
+            )
+            command.assert_not_called()
+
+    def test_group_members_accept_nested_avatar_object(self):
+        payload = {
+            "success": True,
+            "result": {
+                "hasMore": False,
+                "list": [{
+                    "memberEmpName": self.contact.name,
+                    "openDingtalkId": self.contact.open_dingtalk_id,
+                    "memberAvatar": {"mediaId": self.url},
+                }],
+            },
+        }
+        completed = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+        dws = core.DwsClient("/fixture/dws", Mock(), "corp:account")
+        with patch("listener_core.run_read_command", return_value=completed):
+            members = dws.group_members("group-id", "测试群")
+        self.assertEqual(members[0].avatar_media_id, self.url)
 
     def resolver(self, lookup, publish):
         resolver = SenderAvatars(lookup, publish)
@@ -181,6 +299,12 @@ class AvatarTests(unittest.TestCase):
             self.assertEqual(submit.call_count, 2)
             self.assertEqual(updates, [("task-3", self.url)])
 
+    def test_event_avatar_can_seed_the_session_cache(self):
+        updates = []
+        resolver = self.resolver(Mock(), lambda task_id, url: updates.append((task_id, url)))
+        resolver.remember(self.contact.open_dingtalk_id, self.url)
+        resolver.request(self.contact, "task-1")
+        self.assertEqual(updates, [("task-1", self.url)])
     def test_stopping_does_not_publish_late_avatar_results(self):
         entered, release = threading.Event(), threading.Event()
         updates = []

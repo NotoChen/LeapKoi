@@ -9,7 +9,7 @@ import time
 from typing import Any, Callable, Mapping
 
 import listener_core as core
-from avatars import SenderAvatars, lookup_sender_avatar
+from avatars import SenderAvatars, avatar_url, lookup_sender_avatar
 from lifecycle import startup_decision
 from protocol import Events, EventConsole, EventNotifier
 
@@ -86,7 +86,8 @@ class ApplicationEngine(core.ApprovalEngine):
         self._approval_prefetch: dict[str, Future[core.ApprovalInfo]] = {}
         self._metadata_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mr-metadata")
         self._metadata_lock = threading.Lock()
-        self._metadata_pending: set[str] = set()
+        self._metadata_pending: set[tuple[str, str]] = set()
+        self._approval_refresh_pending: set[tuple[str, str]] = set()
         self._closed = False
 
     def apply_settings(self, settings: dict[str, Any]) -> None:
@@ -168,7 +169,6 @@ class ApplicationEngine(core.ApprovalEngine):
             if details is not None:
                 self._publish_details(details)
             raise
-        self._publish_details(plan.details)
         self._publish_approvals(ref, plan.approvals, plan.approvals_known)
         return plan
 
@@ -180,6 +180,12 @@ class ApplicationEngine(core.ApprovalEngine):
                  commit_count=counts.get(ref.key), author=details.author_name,
                  sha=details.sha, created_at=details.created_at, updated_at=details.updated_at,
                  merged_by=details.merged_by_name, **({"actor": actor} if actor is not None else {}))
+
+    def _details_loaded(self, details: core.MRDetails) -> None:
+        # Publish the merge request as soon as its metadata is available. The
+        # approval lookup may still be in flight, but the user can already see
+        # the title, author, SHA and (for an existing merge) the actual merger.
+        self._publish_details(details)
 
     def _publish_approvals(
         self,
@@ -264,6 +270,7 @@ class ApplicationEngine(core.ApprovalEngine):
         if isinstance(counts, dict) and ref.key in counts:
             return
         task_id = self.task_id
+        pending_key = (task_id, ref.key)
 
         def load() -> None:
             self.console.local.task_id = task_id
@@ -284,17 +291,90 @@ class ApplicationEngine(core.ApprovalEngine):
                     )
             finally:
                 with self._metadata_lock:
-                    self._metadata_pending.discard(ref.key)
+                    self._metadata_pending.discard(pending_key)
 
         with self._metadata_lock:
-            if ref.key in self._metadata_pending or self._closed:
+            if pending_key in self._metadata_pending or self._closed:
                 return
-            self._metadata_pending.add(ref.key)
+            self._metadata_pending.add(pending_key)
         try:
             self._metadata_pool.submit(load)
         except RuntimeError:
             with self._metadata_lock:
-                self._metadata_pending.discard(ref.key)
+                self._metadata_pending.discard(pending_key)
+
+    def _finalize_approvals(
+        self,
+        ref: core.MRRef,
+        plan: core.MRPlan,
+        approvals: core.ApprovalInfo | None,
+        approval_count: int,
+        prefix: str,
+    ) -> core.ApprovalInfo | None:
+        # The merge result is already authoritative. Do not hold the visible
+        # completion state behind one more GitLab read; refresh approvers in
+        # the background and publish the delta when it arrives.
+        self._schedule_approval_refresh(
+            ref,
+            plan,
+            approvals,
+            approval_count,
+            prefix,
+        )
+        return approvals
+
+    def _schedule_approval_refresh(
+        self,
+        ref: core.MRRef,
+        plan: core.MRPlan,
+        previous_approvals: core.ApprovalInfo | None,
+        approval_count: int,
+        prefix: str,
+    ) -> None:
+        task_id = self.task_id
+        refresh_key = (task_id, ref.key)
+        with self._metadata_lock:
+            if self._closed or refresh_key in self._approval_refresh_pending:
+                return
+            self._approval_refresh_pending.add(refresh_key)
+
+        def load() -> None:
+            self.console.local.task_id = task_id
+            self.console.local.mr_key = ref.key
+            try:
+                fresh = self._load_preflight_approvals(ref, plan.use_leader)
+                if previous_approvals is not None:
+                    for user_id, name in previous_approvals.approved_by.items():
+                        fresh.approved_by.setdefault(user_id, name)
+                if approval_count or fresh.user_has_approved:
+                    fresh.approved_by.setdefault(plan.actor.user_id, plan.actor.name)
+                self.events.send(
+                    "mr",
+                    task_id=task_id,
+                    key=ref.key,
+                    approvers=list(self._approver_names(fresh)),
+                    approvals_known=True,
+                    approved_by_own=self._approved_by_own(fresh),
+                )
+            except core.ProcessingStopped:
+                pass
+            except core.AutomationError as error:
+                self.console.warning(
+                    f"{prefix} 合并已完成，但读取最终审批人失败，"
+                    f"保留处理中的审批记录：{error}"
+                )
+                self.console.debug(error.detail)
+            except Exception as error:
+                self.console.debug(f"{prefix} 后台刷新审批人异常：{error!r}")
+            finally:
+                with self._metadata_lock:
+                    self._approval_refresh_pending.discard(refresh_key)
+
+        try:
+            self._metadata_pool.submit(load)
+        except RuntimeError:
+            with self._metadata_lock:
+                self._approval_refresh_pending.discard(refresh_key)
 
     def _process_one(self, ref: core.MRRef, index: int, total: int):
         started = time.monotonic()
@@ -315,9 +395,6 @@ class ApplicationEngine(core.ApprovalEngine):
                      stage=self._stage_for(ref),
                      error=result.error or "", elapsed=time.monotonic() - started,
                      owned_merge=result.owned_merge,
-                     approvers=list(result.approvers),
-                     approvals_known=result.approvals_known,
-                     approved_by_own=result.approved_by_own,
                      merged_by=result.merged_by,
                      merge_owner_known=result.merge_owner_known)
             return result
@@ -358,7 +435,7 @@ class ApplicationEngine(core.ApprovalEngine):
         started: float,
     ) -> None:
         """Show completed MRs immediately while the rest of the message runs."""
-        if len(results) >= total:
+        if self.stop_event.is_set() or len(results) >= total:
             return
         rows = [
             self._mr_result_summary(task.refs[index - 1], results[index])
@@ -439,6 +516,13 @@ class ApplicationEngine(core.ApprovalEngine):
                     stopped = True
                     stopped_count += 1
                     results[index] = core.MRResult()
+                    self._mr(
+                        task.refs[index - 1],
+                        status="stopped",
+                        stage="",
+                        error="",
+                        summary="监听已停止，未继续处理",
+                    )
                 except Exception as error:
                     message = f"任务处理异常：{error}"
                     self.console.error(message)
@@ -504,11 +588,16 @@ class ApplicationEngine(core.ApprovalEngine):
         # approval result look slower than it is.
         emit_task_update()
         if should_receive:
-            self._wait_until_unlocked("添加收到表态")
             try:
+                self._wait_until_unlocked("添加收到表态")
                 self.dws.add_received(task.conversation_id, task.message_id)
                 received = True
                 self.console.success("已给原消息添加收到表态")
+            except core.ProcessingStopped:
+                # GitLab work is already complete. Stopping during the
+                # best-effort DingTalk receipt must not turn the task back
+                # into an unfinished processing job.
+                receipt_error = "监听已停止，未添加收到"
             except core.AutomationError as error:
                 receipt_error = str(error)
                 self.console.error(f"MR 处理已结束，添加收到失败：{error}")
@@ -520,10 +609,20 @@ class ApplicationEngine(core.ApprovalEngine):
                 summary += f"，添加收到失败：{receipt_error}"
             emit_task_update()
 
+        notification_summary = summary
+        if mr_summaries:
+            notification_summary += "；" + "；".join(mr_summaries)
         if stopped:
-            self.notifier.send("代码审批已停止", summary, task.sender_name, task_id=task.event_key)
+            self.notifier.send("代码审批已停止", notification_summary, task.sender_name, task_id=task.event_key)
         else:
-            self.notifier.send("代码审批处理完成" if status == "completed" else "代码审批处理失败" if status == "failed" else "代码审批部分完成", summary, task.sender_name, task_id=task.event_key)
+            self.notifier.send(
+                "代码审批处理完成" if status == "completed"
+                else "代码审批处理失败" if status == "failed"
+                else "代码审批部分完成",
+                notification_summary,
+                task.sender_name,
+                task_id=task.event_key,
+            )
 
     @staticmethod
     def _mr_result_summary(ref: core.MRRef, result: core.MRResult) -> str:
@@ -597,6 +696,9 @@ class ApplicationRuntime(core.ListenerRuntime):
         with self._accept_lock:
             with self.tasks.mutex:
                 self.tasks.maxsize = current["queue_capacity"]
+            # The mark-read worker uses a separate bounded queue. Keep its
+            # capacity aligned with the approval queue when settings change.
+            self._mark_read_tasks.maxsize = max(1, current["queue_capacity"])
         self.max_urls = current["max_mrs_per_message"]
         self.reconnect_delays = tuple(current["reconnect_delays"])
         if hasattr(self.engine, "apply_settings"):
@@ -629,9 +731,12 @@ class ApplicationRuntime(core.ListenerRuntime):
 
     def _task_record(self, event: Mapping[str, Any], key: str, sender: str, refs=(), **values: Any) -> None:
         sender_id = str(event.get("sender_open_dingtalk_id", ""))
+        event_avatar = avatar_url(core.first_avatar_value(event))
+        if event_avatar and sender_id:
+            self.avatars.remember(sender_id, event_avatar)
         self.events.send("task", task={
             "id": key, "sender": sender, "received_at": time.time(),
-            "sender_avatar_url": self.avatars.cached_url(sender_id),
+            "sender_avatar_url": event_avatar or self.avatars.cached_url(sender_id),
             "conversation_id": str(event.get("conversation_id", "")),
             "conversation_title": self.approval_group.title,
             "message_id": str(event.get("message_id", "")),
@@ -640,7 +745,7 @@ class ApplicationRuntime(core.ListenerRuntime):
             "mrs": [{"key": r.key, "url": r.url, "title": "", "status": "waiting"} for r in refs],
             **values,
         })
-        if values.get("status") != "discarded" and sender_id in self.allowed_senders:
+        if not event_avatar and values.get("status") != "discarded" and sender_id in self.allowed_senders:
             self.avatars.request(self.allowed_senders[sender_id], key)
 
     def _handle_event(self, event: Mapping[str, Any]) -> None:
@@ -671,16 +776,30 @@ class ApplicationRuntime(core.ListenerRuntime):
             pass
         try:
             detail = None
-            # Only fetch the quote when the message itself cannot provide the
-            # links. This keeps the serial event consumer off DWS for the
-            # common case while still supporting quoted MR approvals.
-            if settings["parse_quoted_messages"] and direct_refs is None:
-                try:
-                    detail = self.dws.message_by_id(str(event["message_id"]))
-                except core.AutomationError as error:
-                    self.console.warning(f"引用内容暂时不可用，继续检查正文：{error}")
-            refs, used_quote = core.extract_mr_refs_from_message(
-                str(event["content"]), detail, self.gitlab_host, settings["max_mrs_per_message"])
+            # Prefer an embedded quote over a remote lookup. A remote lookup
+            # is only needed when the message has no links and DWS did not
+            # include the quoted message in the flattened event.
+            embedded_quote = core.quoted_message(event)
+            if settings["parse_quoted_messages"] and (
+                direct_refs is None or embedded_quote is not None
+            ):
+                if embedded_quote is not None:
+                    detail = event
+                elif direct_refs is None:
+                    try:
+                        detail = self.dws.message_by_id(str(event["message_id"]))
+                    except core.AutomationError as error:
+                        self.console.warning(f"引用内容暂时不可用，继续检查正文：{error}")
+            if detail is not None:
+                refs, used_quote = core.extract_mr_refs_from_message(
+                    str(event["content"]), detail, self.gitlab_host,
+                    settings["max_mrs_per_message"])
+            elif direct_refs is not None:
+                refs, used_quote = direct_refs, False
+            else:
+                refs, used_quote = core.extract_mr_refs_from_message(
+                    str(event["content"]), None, self.gitlab_host,
+                    settings["max_mrs_per_message"])
         except core.AutomationError as error:
             self._task_record(event, key, sender, status="invalid", summary="消息无法处理", error=str(error))
             return
@@ -791,7 +910,9 @@ class ApplicationRuntime(core.ListenerRuntime):
                 self.stop_event.wait(0.2)
                 continue
             try:
-                task = self.tasks.get(timeout=0.3)
+                # The queue is woken by a message or by the explicit shutdown
+                # sentinel, so idle polling only adds latency to every click.
+                task = self.tasks.get()
             except queue.Empty:
                 continue
             if task is None:
@@ -871,6 +992,7 @@ class ApplicationRuntime(core.ListenerRuntime):
         self._start_mark_read_worker()
         monitor.start()
         worker.start()
+        self._recover_stale_bus_before_listen()
         pre_ready_failures = 0
         reconnect_index = 0
         try:

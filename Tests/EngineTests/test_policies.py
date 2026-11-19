@@ -115,6 +115,39 @@ class PolicyTests(unittest.TestCase):
         runtime._handle_event(self.event())
         self.assertEqual(self.dws.lookups, [])
 
+    def test_quote_embedded_in_event_does_not_wait_for_dws_lookup(self):
+        for quote_key, message_key in (
+            ("quoted_message", "open_message_id"),
+            ("quotedMessage", "openMessageId"),
+        ):
+            with self.subTest(quote_key=quote_key):
+                self.output.clear()
+                self.dws.lookups.clear()
+                runtime = self.runtime()
+                event = self.event()
+                event["content"] = "请审批引用里的 MR"
+                event[quote_key] = {
+                    message_key: "quoted",
+                    "content": "请审批 https://git2.superboss.cc/erp/erp-core/-/merge_requests/9",
+                }
+                runtime._handle_event(event)
+                self.assertEqual(self.dws.lookups, [])
+                self.assertEqual(runtime.tasks.get_nowait().refs[0].iid, 9)
+
+    def test_direct_link_and_embedded_quote_are_combined_without_a_lookup(self):
+        runtime = self.runtime()
+        event = self.event(1)
+        event["quoted_message"] = {
+            "open_message_id": "quoted",
+            "content": "补充 https://git2.superboss.cc/erp/erp-core/-/merge_requests/9",
+        }
+        runtime._handle_event(event)
+        self.assertEqual(self.dws.lookups, [])
+        self.assertEqual(
+            [ref.iid for ref in runtime.tasks.get_nowait().refs],
+            [1, 9],
+        )
+
     def test_avatar_loading_does_not_delay_queue_and_only_updates_its_request(self):
         entered, release, published = threading.Event(), threading.Event(), threading.Event()
         def lookup(*_):
@@ -141,6 +174,19 @@ class PolicyTests(unittest.TestCase):
             self.assertNotIn("status", update)
         finally:
             release.set()
+
+    def test_avatar_embedded_in_the_event_avoids_a_second_lookup(self):
+        runtime = self.runtime()
+        event = self.event()
+        event["senderAvatarUrl"] = "http://static-legacy.dingtalk.com/sender.jpg"
+        runtime._handle_event(event)
+        task = next(item["task"] for item in self.output if item["type"] == "task")
+        self.assertEqual(
+            task["sender_avatar_url"],
+            "https://static-legacy.dingtalk.com/sender.jpg",
+        )
+        self.avatar_lookup.assert_not_called()
+        self.assertEqual(runtime.tasks.qsize(), 1)
 
     def test_paused_queue_never_executes_before_resume(self):
         self.settings["paused_message_policy"] = "queue"

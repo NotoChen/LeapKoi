@@ -29,6 +29,34 @@ def allowed_avatar_url(value: str) -> bool:
                for suffix in AVATAR_HOST_SUFFIXES)
 
 
+def normalized_avatar_url(value: str) -> str:
+    if value.startswith("//"):
+        value = "https:" + value
+    try:
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or parsed.username
+        or parsed.password
+        or port not in (None, 443)
+    ):
+        return ""
+    if not any(hostname == suffix or hostname.endswith("." + suffix)
+               for suffix in AVATAR_HOST_SUFFIXES):
+        return ""
+    # DingTalk's legacy API often returns an HTTP avatar even though the same
+    # object is available over HTTPS. Upgrade it instead of dropping the
+    # avatar entirely.
+    if parsed.scheme.lower() == "http":
+        parsed = parsed._replace(scheme="https")
+    return parsed.geturl()
+
+
 def messagepack_uint(data: bytes, position: int) -> tuple[int, int] | None:
     if position >= len(data):
         return None
@@ -90,10 +118,12 @@ def avatar_url(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         return ""
     value = value.strip()
-    if value.lower().startswith("https://"):
-        return value if allowed_avatar_url(value) else ""
-    encoded = value.removeprefix("@")
-    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", encoded):
+    if value.startswith("//") or value.lower().startswith(("http://", "https://")):
+        return normalized_avatar_url(value)
+    encoded = value.removeprefix("@").strip().rstrip("=")
+    # DWS has used both URL-safe and regular base64 for media IDs. Accept both
+    # instead of turning a valid avatar into the placeholder.
+    if not re.fullmatch(r"[A-Za-z0-9+/_-]{8,256}", encoded):
         return ""
     try:
         data = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
@@ -121,6 +151,23 @@ def lookup_sender_avatar(dws: core.DwsClient, contact: core.ContactCandidate) ->
     group_avatar = avatar_url(contact.avatar_media_id)
     if group_avatar:
         return group_avatar
+    if not contact.open_dingtalk_id:
+        return ""
+    resolved_contact = contact
+    try:
+        contacts = dws.search_contacts(contact.name)
+    except core.AutomationError:
+        contacts = []
+    exact_contacts = [
+        candidate
+        for candidate in contacts
+        if candidate.open_dingtalk_id == contact.open_dingtalk_id
+    ]
+    if exact_contacts:
+        resolved_contact = exact_contacts[0]
+        contact_avatar = avatar_url(resolved_contact.avatar_media_id)
+        if contact_avatar:
+            return contact_avatar
     description = f"读取{contact.name}的头像"
     completed = core.run_command(
         dws.command("aisearch", "person", "--query", contact.name, "--dimension", "name", "--format", "json"),
@@ -136,9 +183,21 @@ def lookup_sender_avatar(dws: core.DwsClient, contact: core.ContactCandidate) ->
         raise core.AutomationError("发送人头像查询返回格式异常")
     # Names are only search terms. Bind the result to the exact identity that
     # was admitted from the configured group, including when names are shared.
-    matches = [row for row in rows if isinstance(row, dict)
-               and row.get("openDingTalkId") == contact.open_dingtalk_id]
-    urls = {avatar_url(row.get("authorAvatar")) for row in matches}
+    # Some DWS versions omit openDingTalkId from aisearch results; in that
+    # case the exact userId resolved by contact search is the stable fallback.
+    matches = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_open_id = str(row.get("openDingTalkId") or "").strip()
+        row_user_id = str(row.get("userId") or "").strip()
+        if row_open_id:
+            if row_open_id == contact.open_dingtalk_id:
+                matches.append(row)
+        elif resolved_contact.user_id and row_user_id == resolved_contact.user_id:
+            matches.append(row)
+    urls = {avatar_url(core.first_avatar_value(row)) for row in matches}
+    urls.discard("")
     return urls.pop() if len(urls) == 1 else ""
 
 
@@ -156,6 +215,13 @@ class SenderAvatars:
         with self.lock:
             url, expires = self.cache.get(sender_id, ("", 0))
             return url if expires > time.monotonic() else ""
+
+    def remember(self, sender_id: str, url: str) -> None:
+        if not sender_id or not url:
+            return
+        with self.lock:
+            if not self.closed:
+                self.cache[sender_id] = (url, float("inf"))
 
     def request(self, contact: core.ContactCandidate, task_id: str) -> None:
         sender_id = contact.open_dingtalk_id

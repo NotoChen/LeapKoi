@@ -126,14 +126,63 @@ class ExecutionTests(unittest.TestCase):
 
     def test_full_sequence_approves_and_merges_the_checked_sha(self):
         result = self.process(self.glab.add())
-        self.assertEqual(self.glab.calls[:6], [
+        self.assertEqual(self.glab.calls[:4], [
             ("details", 1), ("approvals", 1, False),
             ("approve", 1, "sha-original", False),
             ("merge", 1, "sha-original", False),
-            ("details", 1), ("approvals", 1, False),
         ])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(self.receipts, ["message"])
+
+    def test_completion_is_visible_before_final_approver_refresh(self):
+        ref = self.glab.add()
+        self.glab.return_merge_details = True
+        refresh_started = threading.Event()
+        refresh_release = threading.Event()
+        original = self.glab.approvals
+
+        def approvals(ref, use_leader=False):
+            if self.glab.items[ref.iid].state == "merged":
+                refresh_started.set()
+                refresh_release.wait(2)
+            return original(ref, use_leader)
+
+        with patch.object(self.glab, "approvals", side_effect=approvals):
+            result = self.process(ref)
+            self.assertTrue(refresh_started.wait(2))
+            updates = [event for event in self.events if event["type"] == "task_update"]
+            self.assertEqual(updates[-1]["status"], "completed")
+            refresh_release.set()
+        self.assertEqual(result["merged_count"], 1)
+
+    def test_empty_background_refresh_keeps_known_approvers(self):
+        ref = self.glab.add()
+        self.glab.return_merge_details = True
+        self.glab.approvers[1] = {20: "张三"}
+        refresh_done = threading.Event()
+        original = self.glab.approvals
+
+        def approvals(ref, use_leader=False):
+            if self.glab.items[ref.iid].state == "merged":
+                refresh_done.set()
+                return core.ApprovalInfo(1, 0, False, True, {30: "李四"})
+            return original(ref, use_leader)
+
+        with patch.object(self.glab, "approvals", side_effect=approvals):
+            result = self.process(ref)
+            self.assertTrue(refresh_done.wait(2))
+            deadline = time.monotonic() + 2
+            while not any(
+                event.get("type") == "mr"
+                and event.get("key") == ref.key
+                and event.get("approvers") == ["张三", "本人", "李四"]
+                for event in self.events
+            ) and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        self.assertEqual(result["merged_count"], 1)
+        self.assertEqual(self.mr_state(ref)["approvers"], ["张三", "本人", "李四"])
+        self.assertTrue(self.mr_state(ref)["approved_by_own"])
 
     def test_display_only_commit_count_runs_after_merge(self):
         ref = self.glab.add()
@@ -157,6 +206,28 @@ class ExecutionTests(unittest.TestCase):
         merge_index = next(index for index, call in enumerate(self.glab.calls) if call[0] == "merge")
         self.assertFalse(any(call[0] == "details" for call in self.glab.calls[merge_index + 1:]))
         self.assertEqual(self.mr_state(ref)["merged_by"], "本人")
+
+    def test_merge_response_without_identity_reads_the_actual_merger(self):
+        ref = self.glab.add()
+        original_merge = self.glab.merge
+
+        def merge_without_identity(ref, sha, use_leader=False):
+            original_merge(ref, sha, use_leader)
+            return replace(
+                self.glab.items[ref.iid],
+                merged_by_id=None,
+                merged_by_name="",
+            )
+
+        with patch.object(self.glab, "merge", side_effect=merge_without_identity):
+            result = self.process(ref)
+
+        merge_index = next(index for index, call in enumerate(self.glab.calls) if call[0] == "merge")
+        self.assertTrue(any(call[0] == "details" for call in self.glab.calls[merge_index + 1:]))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(self.mr_state(ref)["merged_by"], "本人")
+        self.assertTrue(self.mr_state(ref)["merge_owner_known"])
+        self.assertTrue(self.mr_state(ref)["owned_merge"])
 
     def test_background_commit_count_stays_attached_to_its_original_task(self):
         self.glab.return_merge_details = True
@@ -281,6 +352,36 @@ class ExecutionTests(unittest.TestCase):
                 patch.object(self.glab, "details", side_effect=details):
             result = self.process(ref)
         self.assertEqual(result["status"], "completed")
+
+    def test_details_are_visible_before_a_slow_approval_lookup_finishes(self):
+        ref = self.glab.add()
+        approval_started = threading.Event()
+        approval_release = threading.Event()
+        original_approvals = self.glab.approvals
+
+        def slow_approvals(ref, use_leader=False):
+            approval_started.set()
+            approval_release.wait(2)
+            return original_approvals(ref, use_leader)
+
+        with patch.object(self.glab, "approvals", side_effect=slow_approvals):
+            worker = threading.Thread(target=self.process, args=(ref,))
+            worker.start()
+            self.assertTrue(approval_started.wait(2))
+            details = [
+                event for event in self.events
+                if event["type"] == "mr" and event.get("title") == "测试修改"
+            ]
+            self.assertTrue(details)
+            self.assertFalse(
+                any(
+                    event["type"] == "task_update" and event.get("status") == "completed"
+                    for event in self.events
+                )
+            )
+            approval_release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
 
     def test_task_completion_is_visible_before_the_dingtalk_receipt_finishes(self):
         ref = self.glab.add()
@@ -506,6 +607,21 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(result["status"], "stopped")
         self.assertIn("1 个未完成", result["summary"])
         self.assertEqual(self.mr_state(ref)["status"], "stopped")
+
+    def test_stopped_parallel_task_marks_unstarted_mrs_and_skips_stale_progress(self):
+        first, second = self.glab.add(1), self.glab.add(2)
+        self.stop.set()
+        result = self.process(first, second)
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(self.glab.calls, [])
+        self.assertEqual(self.mr_state(first)["status"], "stopped")
+        self.assertEqual(self.mr_state(second)["status"], "stopped")
+        self.assertFalse(
+            any(
+                event["type"] == "task_update" and event.get("status") == "running"
+                for event in self.events
+            )
+        )
 
     def test_unexpected_mr_failure_does_not_abort_other_mrs(self):
         failed = self.glab.add(1)

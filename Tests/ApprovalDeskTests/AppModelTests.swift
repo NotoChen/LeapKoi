@@ -341,6 +341,22 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(client.launchCount, 1)
     }
 
+    func testStopDuringStartupReleasesBusyStateAndPendingAutoStart() throws {
+        let (model, client, folder) = try fixture()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        model.launch(); model.receive(["type": "hello"])
+        ready(model, client); finishAccounts(model, client)
+        model.start()
+        let startID = client.startRequestID
+        XCTAssertTrue(model.isBusy)
+        model.stop()
+        model.receive(["type": "state", "status": "stopped", "connected": false])
+        model.receive(["type": "operation_finished", "command": "start", "request_id": startID])
+        XCTAssertFalse(model.isBusy)
+        model.receive(["type": "hello"])
+        XCTAssertEqual(client.commands.filter { $0 == "start" }.count, 1)
+    }
+
     func testWorkerExitAfterListeningStoppedDoesNotRestart() async throws {
         let (model, client, folder) = try fixture(autoStart: true)
         defer { try? FileManager.default.removeItem(at: folder) }

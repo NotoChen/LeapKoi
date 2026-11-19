@@ -222,9 +222,37 @@ struct MRItem: Identifiable, Equatable {
         return approvedByOwn ? "审批人：\(names) · 本机参与" : "审批人：\(names) · 均为其他成员"
     }
     var mergeSummary: String {
-        guard !mergedBy.isEmpty else { return "合并人：GitLab 未返回" }
+        if mergedBy.isEmpty {
+            guard mergeOwnerKnown else { return "合并人：GitLab 未返回" }
+            return ownedMerge
+                ? "合并人：本机（GitLab 未返回姓名）"
+                : "合并人：其他成员（GitLab 未返回姓名）"
+        }
         guard mergeOwnerKnown else { return "合并人：\(mergedBy) · 归属未知" }
         return ownedMerge ? "合并人：\(mergedBy) · 本机" : "合并人：\(mergedBy) · 其他成员"
+    }
+    var resultSummary: String {
+        var parts: [String] = []
+        if approvalsKnown {
+            let names = approvers.isEmpty ? "未返回" : approvers.joined(separator: "、")
+            parts.append("审批人 \(names)（\(approvedByOwn ? "本机参与" : "其他成员")）")
+        } else {
+            parts.append("审批人未获取")
+        }
+        if status == "completed" || !mergedBy.isEmpty || mergeOwnerKnown || ownedMerge {
+            if mergedBy.isEmpty {
+                parts.append("合并人未返回")
+            } else {
+                let ownership = ownedMerge ? "本机" : mergeOwnerKnown ? "其他成员" : "归属未知"
+                parts.append("合并人 \(mergedBy)（\(ownership)）")
+            }
+        } else if status == "failed" {
+            let failedStage = ["preflight": "检查", "approval": "审批", "merge": "合并"][stage] ?? "处理"
+            parts.append("\(failedStage)失败")
+        } else {
+            parts.append("未完成")
+        }
+        return "\(key)：" + parts.joined(separator: "；")
     }
 
     init(_ data: [String: Any]) {
@@ -307,6 +335,9 @@ struct ApprovalTask: Identifiable, Equatable {
     var hasErrors: Bool { ["failed", "partial", "invalid"].contains(status) }
     var waiting: Bool { status == "queued" }
     var running: Bool { status == "running" }
+    var resolvedMRSummaries: [String] {
+        mrs.isEmpty ? mrSummaries : mrs.map(\.resultSummary)
+    }
 }
 
 struct ActivityLog: Identifiable {

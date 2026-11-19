@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 import threading
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "Engine"))
 import listener_core as core
@@ -78,6 +78,104 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(len(refs), 2)
         finally:
             core.MAX_URLS = saved
+
+
+class EventBusRecoveryTests(unittest.TestCase):
+    pid = 4242
+    client_id = "ding-test-client"
+
+    def payload(self, *, consumers=None, subscriptions=None, holder_pid=None, live_pid=None):
+        if consumers is None:
+            consumers = []
+        if subscriptions is None:
+            subscriptions = []
+        holder_pid = self.pid if holder_pid is None else holder_pid
+        live_pid = self.pid if live_pid is None else live_pid
+        return {
+            "bus": {
+                "entry": {
+                    "holder_pid": holder_pid,
+                    "state": "running",
+                    "meta": {"client_id": self.client_id},
+                },
+                "live": {
+                    "bus": {"pid": live_pid, "client_id": self.client_id},
+                    "consumers": consumers,
+                },
+            },
+            "subscriptions": subscriptions,
+        }
+
+    def recover(self, payload, *, process_command=None, kill=None):
+        status = Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+        process = Mock(
+            returncode=0,
+            stdout=process_command
+            or f"/fixture/dws event _bus --client-id {self.client_id}",
+            stderr="",
+        )
+        killer = kill or Mock()
+        with patch.object(core.subprocess, "run", side_effect=[status, process]) as run, \
+                patch.object(core.os, "kill", killer):
+            result = core.DwsClient("/fixture/dws", Mock()).recover_stale_event_bus()
+        return result, run, killer
+
+    def test_active_consumer_blocks_bus_termination_even_when_subscriptions_are_empty(self):
+        payload = self.payload(consumers=[{"pid": 9001}])
+        (recovered, message), run, kill = self.recover(payload)
+        self.assertFalse(recovered)
+        self.assertIn("1 个活跃消费者", message)
+        self.assertEqual(run.call_count, 1)
+        kill.assert_not_called()
+
+    def test_active_subscription_still_blocks_bus_termination(self):
+        (recovered, message), _run, kill = self.recover(
+            self.payload(subscriptions=[{"id": "subscription"}])
+        )
+        self.assertFalse(recovered)
+        self.assertIn("活跃订阅", message)
+        kill.assert_not_called()
+
+    def test_unconfirmable_consumer_state_is_not_treated_as_idle(self):
+        payload = self.payload()
+        payload["bus"]["live"].pop("consumers")
+        (recovered, message), _run, kill = self.recover(payload)
+        self.assertFalse(recovered)
+        self.assertIn("消费者列表", message)
+        kill.assert_not_called()
+
+    def test_mismatched_live_pid_blocks_bus_termination(self):
+        (recovered, message), _run, kill = self.recover(
+            self.payload(live_pid=self.pid + 1)
+        )
+        self.assertFalse(recovered)
+        self.assertIn("PID 不一致", message)
+        kill.assert_not_called()
+
+    def test_empty_subscriptions_and_consumers_allow_safe_recovery(self):
+        def kill(pid, signum):
+            self.assertEqual(pid, self.pid)
+            if signum == core.signal.SIGTERM:
+                return
+            self.assertEqual(signum, 0)
+            raise ProcessLookupError
+
+        (recovered, message), _run, killer = self.recover(
+            self.payload(),
+            kill=Mock(side_effect=kill),
+        )
+        self.assertTrue(recovered)
+        self.assertIn(f"旧 DWS 事件总线 {self.pid}", message)
+        self.assertEqual(killer.call_count, 2)
+
+    def test_process_without_matching_client_id_is_not_terminated(self):
+        (recovered, message), _run, kill = self.recover(
+            self.payload(),
+            process_command="/fixture/dws event _bus --client-id another-client",
+        )
+        self.assertFalse(recovered)
+        self.assertIn("client-id 不一致", message)
+        kill.assert_not_called()
 
 
 if __name__ == "__main__": unittest.main()

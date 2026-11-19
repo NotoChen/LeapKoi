@@ -59,6 +59,10 @@ class GitLabHTTPClient(core.GlabClient):
         self._token_lock = threading.Lock()
         self._direct_disabled = False
         self._connections = threading.local()
+        # Certificate loading is comparatively expensive. Reuse one validated
+        # context across the approval and prefetch workers; each worker still
+        # owns its own long-lived HTTP connection.
+        self._ssl_context = ssl.create_default_context()
 
     def _token(self, use_leader: bool) -> str:
         if use_leader:
@@ -110,8 +114,19 @@ class GitLabHTTPClient(core.GlabClient):
             connection = http.client.HTTPSConnection(
                 self.hostname,
                 timeout=self._direct_timeout(),
-                context=ssl.create_default_context(),
+                context=self._ssl_context,
             )
+            try:
+                connection.connect()
+                if connection.sock is not None:
+                    connection.sock.setsockopt(
+                        socket.IPPROTO_TCP,
+                        socket.TCP_NODELAY,
+                        1,
+                    )
+            except Exception:
+                connection.close()
+                raise
             self._connections.value = connection
         return connection
 

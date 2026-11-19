@@ -720,6 +720,63 @@ class ContactCandidate:
         return f"{self.name}（{'，'.join(details)}）"
 
 
+def first_avatar_value(item: Mapping[str, Any]) -> str:
+    """Read the avatar aliases used by DingTalk APIs and DWS shortcuts."""
+    names = (
+        "memberAvatarMediaId",
+        "groupMemberAvatarMediaId",
+        "senderAvatarMediaId",
+        "senderAvatarUrl",
+        "senderAvatarURL",
+        "senderAvatar",
+        "avatarMediaId",
+        "memberAvatar",
+        "groupMemberAvatar",
+        "avatar",
+        "avatarUrl",
+        "authorAvatar",
+        "profilePhotoUrl",
+        "headImageUrl",
+        "headImage",
+        "headImg",
+        "portrait",
+        "portraitUrl",
+        "userAvatar",
+    )
+    for name in names:
+        value = item.get(name)
+        if isinstance(value, Mapping):
+            nested = first_avatar_value(value)
+            if nested:
+                return nested
+            value = (
+                value.get("mediaId")
+                or value.get("media_id")
+                or value.get("url")
+                or value.get("avatar")
+            )
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    # Future/flattened event versions may wrap the sender identity in a
+    # nested object instead of exposing the avatar alias at the top level.
+    for name in (
+        "senderInfo",
+        "sender_info",
+        "sender",
+        "memberInfo",
+        "member_info",
+        "member",
+        "user",
+        "profile",
+    ):
+        value = item.get(name)
+        if isinstance(value, Mapping):
+            nested = first_avatar_value(value)
+            if nested:
+                return nested
+    return ""
+
+
 @dataclass(frozen=True)
 class GroupCandidate:
     title: str
@@ -929,10 +986,14 @@ def extract_mr_refs_from_message(
             contents.append(detail_content)
             seen_contents.add(detail_content)
 
-        quoted = current.get("quotedMessage")
+        quoted = quoted_message(current)
         if not isinstance(quoted, Mapping):
             break
-        quoted_id = str(quoted.get("openMessageId") or "").strip()
+        quoted_id = str(
+            quoted.get("openMessageId")
+            or quoted.get("open_message_id")
+            or ""
+        ).strip()
         if quoted_id:
             if quoted_id in visited_message_ids:
                 break
@@ -946,6 +1007,15 @@ def extract_mr_refs_from_message(
         current = quoted
 
     return extract_mr_refs("\n".join(contents), gitlab_host, max_urls), used_quote
+
+
+def quoted_message(value: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Return a quoted message from either flattened or raw DWS payloads."""
+    for key in ("quoted_message", "quotedMessage"):
+        quoted = value.get(key)
+        if isinstance(quoted, Mapping):
+            return quoted
+    return None
 
 
 def normalize_gitlab_hostname(value: str) -> str:
@@ -1322,7 +1392,27 @@ class DwsClient:
             retry_delays=self.retry_delays,
         )
 
-    def recover_stale_event_bus(self) -> tuple[bool, str]:
+    @staticmethod
+    def _event_bus_consumers(payload: Any) -> list[dict[str, Any]] | None:
+        if not isinstance(payload, dict):
+            return None
+        bus = payload.get("bus")
+        live = bus.get("live") if isinstance(bus, dict) else None
+        consumers = live.get("consumers") if isinstance(live, dict) else None
+        if not isinstance(consumers, list) or any(
+            not isinstance(consumer, dict) for consumer in consumers
+        ):
+            return None
+        return consumers
+
+    @staticmethod
+    def _event_bus_subscriptions(payload: Any) -> list[Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        subscriptions = payload.get("subscriptions")
+        return subscriptions if isinstance(subscriptions, list) else None
+
+    def recover_stale_event_bus(self, timeout: float = 30.0) -> tuple[bool, str]:
         description = "检查 DWS 事件总线状态"
         try:
             completed = subprocess.run(
@@ -1331,7 +1421,7 @@ class DwsClient:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=30,
+                timeout=max(1.0, timeout),
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as error:
@@ -1356,24 +1446,55 @@ class DwsClient:
         if not isinstance(payload, dict):
             return False, "DWS 事件总线状态格式异常"
 
-        subscriptions = payload.get("subscriptions")
-        if not isinstance(subscriptions, list):
+        subscriptions = self._event_bus_subscriptions(payload)
+        if subscriptions is None:
             return False, "DWS 没有返回可确认的订阅列表"
         if subscriptions:
             return False, "DWS 仍有活跃订阅，为避免中断其他监听，不自动停止总线"
 
         bus = payload.get("bus")
-        if isinstance(bus, dict) and isinstance(bus.get("live"), dict):
-            return False, "DWS 事件总线仍能正常响应，为避免误伤其他监听，不自动停止"
         entry = bus.get("entry") if isinstance(bus, dict) else None
         if not isinstance(entry, dict) or entry.get("state") != "running":
             return False, "没有发现仍在运行的旧 DWS 事件总线"
+
+        consumers = self._event_bus_consumers(payload)
+        if consumers is None:
+            return False, "DWS 没有返回可确认的消费者列表"
+        if consumers:
+            return (
+                False,
+                f"DWS 仍有 {len(consumers)} 个活跃消费者，"
+                "为避免中断其他监听，不自动停止总线",
+            )
+
         try:
             pid = int(entry.get("holder_pid") or 0)
         except (TypeError, ValueError):
             pid = 0
         if pid <= 1 or pid == os.getpid():
             return False, "DWS 返回的旧事件总线 PID 无效"
+
+        live = bus.get("live") if isinstance(bus, dict) else None
+        live_bus = live.get("bus") if isinstance(live, dict) else None
+        try:
+            live_pid = int(live_bus.get("pid") or 0) if isinstance(live_bus, dict) else 0
+        except (TypeError, ValueError):
+            live_pid = 0
+        if live_pid and live_pid != pid:
+            return False, "DWS 状态中的事件总线 PID 不一致，不自动停止"
+
+        meta = entry.get("meta") if isinstance(entry.get("meta"), dict) else {}
+        try:
+            meta_pid = int(meta.get("bus_pid") or 0)
+        except (TypeError, ValueError):
+            meta_pid = 0
+        if meta_pid and meta_pid != pid:
+            return False, "DWS 状态中的事件总线元数据 PID 不一致，不自动停止"
+        client_id = str(
+            (live_bus.get("client_id") if isinstance(live_bus, dict) else "")
+            or meta.get("client_id")
+            or ""
+        ).strip()
 
         try:
             process = subprocess.run(
@@ -1393,6 +1514,11 @@ class DwsClient:
             process_command,
         ):
             return False, f"PID {pid} 不是可确认的 DWS 事件总线，不自动停止"
+        if client_id and not re.search(
+            rf"--client-id(?:=|\s+){re.escape(client_id)}(?:\s|$)",
+            process_command,
+        ):
+            return False, f"PID {pid} 的事件总线 client-id 不一致，不自动停止"
 
         try:
             os.kill(pid, signal.SIGTERM)
@@ -1589,7 +1715,7 @@ class DwsClient:
                     title=str(item.get("memberRoleDesc") or "").strip(),
                     nick=str(item.get("memberNick") or "").strip(),
                     flower_name="",
-                    avatar_media_id=str(item.get("memberAvatarMediaId") or "").strip(),
+                    avatar_media_id=first_avatar_value(item),
                 )
             if result.get("hasMore") is not True:
                 break
@@ -1656,6 +1782,7 @@ class DwsClient:
                     title=str(item.get("title") or "").strip(),
                     nick=str(item.get("nick") or "").strip(),
                     flower_name=str(item.get("flowerName") or "").strip(),
+                    avatar_media_id=first_avatar_value(item),
                 )
             )
         return candidates
@@ -1715,7 +1842,12 @@ class DwsClient:
         for message in messages:
             if not isinstance(message, dict):
                 continue
-            if str(message.get("openMessageId") or "").strip() == message_id:
+            returned_id = str(
+                message.get("openMessageId")
+                or message.get("open_message_id")
+                or ""
+            ).strip()
+            if returned_id == message_id:
                 return message
         raise AutomationError("查询钉钉消息及引用内容未返回当前消息")
 
@@ -1816,6 +1948,9 @@ class ApprovalEngine:
     def _load_preflight_approvals(self, ref: MRRef, use_leader: bool) -> ApprovalInfo:
         return self.glab.approvals(ref, use_leader)
 
+    def _details_loaded(self, details: MRDetails) -> None:
+        """Hook for runtimes that want to publish metadata before approvals."""
+
     def _third_party_names(self, approvals: ApprovalInfo) -> set[str]:
         return {
             name
@@ -1860,6 +1995,7 @@ class ApprovalEngine:
     def _preflight_one(self, ref: MRRef, index: int, total: int) -> MRPlan:
         self._preload_approvals(ref)
         details = self.glab.details(ref)
+        self._details_loaded(details)
         prefix = f"[{index}/{total}] {ref.key}"
         if not details.state:
             raise AutomationError(f"{prefix} 缺少状态")
@@ -2092,6 +2228,19 @@ class ApprovalEngine:
             initial = current
         else:
             if merged_details is not None and merged_details.state == "merged":
+                # A successful merge response is authoritative for the state,
+                # but older GitLab versions can omit merge_user. Read once
+                # more only in that ambiguous case so the UI can name the
+                # person who actually merged instead of reporting "unknown".
+                if merged_details.merged_by_id is None:
+                    try:
+                        current = self.glab.details(plan.ref)
+                        if current.state == "merged":
+                            return current
+                    except AutomationError as error:
+                        self.console.debug(
+                            f"{plan.ref.key} 合并已确认，但补查合并人失败：{error}"
+                        )
                 return merged_details
             initial = merged_details
 
@@ -2147,6 +2296,30 @@ class ApprovalEngine:
     def _on_merge_confirmed(self, details: MRDetails) -> None:
         who = f"已由 {details.merged_by_name} 合并" if details.merged_by_name else "已合并，GitLab 未返回合并人"
         self.console.success(f"{details.ref.key} {who}")
+
+    def _finalize_approvals(
+        self,
+        ref: MRRef,
+        plan: MRPlan,
+        approvals: ApprovalInfo | None,
+        approval_count: int,
+        prefix: str,
+    ) -> ApprovalInfo | None:
+        """Refresh final approvers without changing the merge result."""
+        try:
+            fresh = self.glab.approvals(ref, plan.use_leader)
+            if approvals is not None:
+                for user_id, name in approvals.approved_by.items():
+                    fresh.approved_by.setdefault(user_id, name)
+            if approval_count or fresh.user_has_approved:
+                fresh.approved_by.setdefault(plan.actor.user_id, plan.actor.name)
+            return fresh
+        except AutomationError as error:
+            self.console.warning(
+                f"{prefix} 合并已完成，但读取最终审批人失败，保留处理中的审批记录：{error}"
+            )
+            self.console.debug(error.detail)
+            return approvals
 
     def _process_one(
         self,
@@ -2220,17 +2393,17 @@ class ApprovalEngine:
         # Count the confirmed server state, including an MR merged by someone
         # else. Receipt ownership remains a separate identity check.
         assert final_details is not None
-        if not plan.already_merged:
-            try:
-                approvals = self.glab.approvals(ref, plan.use_leader)
+        if plan is not None and (not plan.already_merged or not approvals_known):
+            fresh_approvals = self._finalize_approvals(
+                ref,
+                plan,
+                approvals,
+                approval_count,
+                prefix,
+            )
+            if fresh_approvals is not None:
+                approvals = fresh_approvals
                 approvals_known = True
-                if approval_count or approvals.user_has_approved:
-                    approvals.approved_by.setdefault(plan.actor.user_id, plan.actor.name)
-            except AutomationError as error:
-                self.console.warning(
-                    f"{prefix} 合并已完成，但读取最终审批人失败，保留处理中的审批记录：{error}"
-                )
-                self.console.debug(error.detail)
         self._on_merge_confirmed(final_details)
         self._record_non_own_merge(final_details, no_received_reasons)
         self.console.success(f"{prefix} 单 MR 流程完成")
@@ -2653,8 +2826,21 @@ class ListenerRuntime:
             else:
                 self.console.debug(status)
 
+    def _recover_stale_bus_before_listen(self) -> None:
+        """Remove an idle bus only when DWS itself confirms it is safe."""
+        try:
+            recovered, message = self.dws.recover_stale_event_bus(timeout=10)
+        except Exception as error:
+            self.console.debug(f"启动前检查旧 DWS 事件总线失败：{error!r}")
+            return
+        if recovered:
+            self.console.success(message)
+        else:
+            self.console.debug(message)
+
     def run(self) -> int:
         self.screen_lock.is_locked_or_unknown()
+        self._recover_stale_bus_before_listen()
         worker = threading.Thread(
             target=self._worker,
             name="approval-worker",
@@ -3197,34 +3383,46 @@ def print_status(console: Console, profile: str | None) -> int:
     try:
         dws = DwsClient(dws_path, console, profile)
         payload = dws.status()
-        live = (
-            payload.get("bus", {}).get("live", {})
-            if isinstance(payload, dict)
-            else {}
+        raw_bus = payload.get("bus") if isinstance(payload, dict) else None
+        live = raw_bus.get("live") if isinstance(raw_bus, dict) else {}
+        source_state = (
+            live.get("source_state") if isinstance(live, dict) else None
         )
         source_state = (
-            live.get("source_state", {}).get("state")
-            if isinstance(live, dict)
-            else None
+            source_state.get("state") if isinstance(source_state, dict) else None
         )
-        consumers = live.get("consumers", []) if isinstance(live, dict) else []
+        consumers = DwsClient._event_bus_consumers(payload)
+        subscriptions = DwsClient._event_bus_subscriptions(payload)
+        consumer_count = len(consumers) if consumers is not None else None
+        subscription_count = (
+            len(subscriptions) if subscriptions is not None else None
+        )
         if source_state == "connected":
-            console.ready(f"钉钉事件总线已连接，消费者数量={len(consumers)}")
-        elif isinstance(payload, dict):
-            bus = payload.get("bus") if isinstance(payload.get("bus"), dict) else {}
-            entry = bus.get("entry") if isinstance(bus.get("entry"), dict) else {}
-            subscriptions = payload.get("subscriptions")
-            subscription_count = (
-                len(subscriptions) if isinstance(subscriptions, list) else 0
-            )
-            if entry.get("state") == "running" and subscription_count > 0:
-                console.ready(
-                    f"钉钉事件总线正在运行，活跃订阅数量={subscription_count}"
-                )
-            elif entry.get("state") == "running":
-                console.warning("钉钉事件总线正在运行，但当前没有活跃订阅")
+            if consumer_count is None:
+                console.warning("钉钉事件总线已连接，但无法确认活跃消费者数量")
+            elif consumer_count == 0:
+                console.warning("钉钉事件总线已连接，但当前没有活跃消费者")
             else:
+                detail = f"钉钉事件总线已连接，消费者数量={consumer_count}"
+                if subscription_count is not None:
+                    detail += f"，订阅列表数量={subscription_count}"
+                console.ready(detail)
+        elif isinstance(payload, dict):
+            bus = raw_bus if isinstance(raw_bus, dict) else {}
+            entry = bus.get("entry") if isinstance(bus.get("entry"), dict) else {}
+            if entry.get("state") != "running":
                 console.warning("钉钉事件总线当前未运行")
+            elif consumer_count is None:
+                console.warning("钉钉事件总线正在运行，但无法确认活跃消费者数量")
+            elif consumer_count == 0:
+                console.warning("钉钉事件总线正在运行，但当前没有活跃消费者")
+            elif subscription_count is None:
+                console.ready(f"钉钉事件总线正在运行，消费者数量={consumer_count}")
+            else:
+                console.ready(
+                    f"钉钉事件总线正在运行，消费者数量={consumer_count}，"
+                    f"订阅列表数量={subscription_count}"
+                )
         else:
             console.warning("钉钉事件总线状态格式异常")
     except AutomationError as error:
