@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import listener_core as core
+import configuration
 from configuration import DEFAULTS, executable, validate
 from gitlab_http import GitLabHTTPClient
 from protocol import Events, EventConsole, EventNotifier
@@ -366,7 +367,7 @@ class Controller:
                 except BlockingIOError:
                     raise core.AutomationError("另一个跃鲤实例已经在监听")
                 fcntl.flock(legacy_handle.fileno(), fcntl.LOCK_UN)
-        folder = core.data_dir()
+        folder = configuration.data_dir()
         folder.mkdir(parents=True, exist_ok=True)
         self.instance_handle = (folder / "engine.lock").open("a+")
         try:

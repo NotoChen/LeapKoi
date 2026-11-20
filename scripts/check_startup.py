@@ -30,7 +30,10 @@ link.symlink_to(resources, target_is_directory=True)
     "CFBundlePackageType": "APPL",
 }))
 subprocess.run(["swiftc", "-sdk", sdk_path(), "-parse-as-library",
-                *[root / "Sources/LeapKoi" / name for name in ("Models.swift", "EngineClient.swift", "LoginItemManager.swift", "AppModel.swift")],
+                *[root / "Sources/LeapKoi" / name for name in (
+                    "Models.swift", "EngineClient.swift", "LoginItemManager.swift",
+                    "PendingTextEdits.swift", "AppModel.swift"
+                )],
                 root / "Tools/CheckAccountStartup.swift", "-o", binary], check=True)
 # Defaults now start listening. Probe a disposable snapshot, while the native
 # command gate still rejects every non-read-only engine operation.
