@@ -24,7 +24,7 @@ extension EngineConnection {
 final class EngineClient: EngineConnection {
     private var process: Process?
     private var input: FileHandle?
-    private let readQueue = DispatchQueue(label: "approvaldesk.engine.output")
+    private let readQueue = DispatchQueue(label: "leapkoi.engine.output")
     private var buffer = Data()
     var onEvent: (([String: Any]) -> Void)?
     var onExit: (() -> Void)?
@@ -39,11 +39,11 @@ final class EngineClient: EngineConnection {
         let embedded = root.appendingPathComponent("Runtime/bin/python3")
         let candidates = [embedded, FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/python3"), URL(fileURLWithPath: "/opt/homebrew/bin/python3"), URL(fileURLWithPath: "/usr/bin/python3")]
         guard let python = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) }) else {
-            throw NSError(domain: "ApprovalDesk", code: 1, userInfo: [NSLocalizedDescriptionKey: "应用内的 Python 运行组件缺失，请重新安装应用"])
+            throw NSError(domain: "LeapKoi", code: 1, userInfo: [NSLocalizedDescriptionKey: "应用内的 Python 运行组件缺失，请重新安装应用"])
         }
         let worker = root.appendingPathComponent("Engine/worker.py")
         guard FileManager.default.fileExists(atPath: worker.path) else {
-            throw NSError(domain: "ApprovalDesk", code: 2, userInfo: [NSLocalizedDescriptionKey: "应用内的执行引擎缺失"])
+            throw NSError(domain: "LeapKoi", code: 2, userInfo: [NSLocalizedDescriptionKey: "应用内的执行引擎缺失"])
         }
         let child = Process()
         child.executableURL = python
@@ -55,7 +55,7 @@ final class EngineClient: EngineConnection {
         env["PYTHONNOUSERSITE"] = "1"
         env.removeValue(forKey: "PYTHONHOME")
         env.removeValue(forKey: "PYTHONPATH")
-        env["APPROVALDESK_DATA_DIR"] = dataDirectory.path
+        env["LEAPKOI_DATA_DIR"] = dataDirectory.path
         env["PATH"] = [root.appendingPathComponent("bin").path, NSHomeDirectory() + "/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"].joined(separator: ":")
         child.environment = env
         let stdout = Pipe(), stdin = Pipe(), stderr = Pipe()

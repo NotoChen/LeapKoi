@@ -180,7 +180,7 @@ class GitLabHTTPClient(core.GlabClient):
         headers = {
             "Accept": "application/json",
             "PRIVATE-TOKEN": token,
-            "User-Agent": "ApprovalDesk",
+            "User-Agent": "LeapKoi",
         }
         if data is not None:
             headers["Content-Type"] = "application/x-www-form-urlencoded"

@@ -1,22 +1,22 @@
-# 审批台 · ApprovalDesk
+# 跃鲤 · LeapKoi
 
-[![macOS CI](https://github.com/NotoChen/ApprovalDesk/actions/workflows/macos.yml/badge.svg)](https://github.com/NotoChen/ApprovalDesk/actions/workflows/macos.yml)
-[![Latest release](https://img.shields.io/github/v/release/NotoChen/ApprovalDesk)](https://github.com/NotoChen/ApprovalDesk/releases/latest)
+[![macOS CI](https://github.com/NotoChen/LeapKoi/actions/workflows/macos.yml/badge.svg)](https://github.com/NotoChen/LeapKoi/actions/workflows/macos.yml)
+[![Latest release](https://img.shields.io/github/v/release/NotoChen/LeapKoi)](https://github.com/NotoChen/LeapKoi/releases/latest)
 
-原生 macOS 钉钉与 GitLab 审批助手。常驻菜单栏，自动接收审批请求，展示每个 MR 的审批、合并结果及发送人头像。SwiftUI + AppKit 提供透明磨砂界面，macOS 26 及以上使用系统 Liquid Glass。
+原生 macOS 钉钉与 GitLab 审批助手。常驻菜单栏，自动接收审批请求，展示每个 MR 的审批、合并结果及发送人头像。SwiftUI + AppKit 提供透明磨砂界面，macOS 26 及以上使用系统 Liquid Glass。「跃鲤」取鲤鱼跃龙门之意：每一条待审批的 MR 都应当越过门槛，抵达合并。
 
-![审批台深色工作台，所有请求均为模拟数据](docs/previews/workspace-dark.png)
+![跃鲤深色工作台，所有请求均为模拟数据](docs/previews/workspace-dark.png)
 
 ## 下载与安装
 
-前往 **[GitHub Releases](https://github.com/NotoChen/ApprovalDesk/releases/latest)**，下载与你的 Mac 匹配的 DMG：
+前往 **[GitHub Releases](https://github.com/NotoChen/LeapKoi/releases/latest)**，下载与你的 Mac 匹配的 DMG：
 
 | Mac 类型 | 安装包文件名 |
 | --- | --- |
-| Apple Silicon（M 系列） | `ApprovalDesk-版本号-macos-arm64.dmg` |
-| Intel | `ApprovalDesk-版本号-macos-x86_64.dmg` |
+| Apple Silicon（M 系列） | `LeapKoi-版本号-macos-arm64.dmg` |
+| Intel | `LeapKoi-版本号-macos-x86_64.dmg` |
 
-要求 **macOS 14 或更新版本**。打开 DMG，将「审批台.app」拖入 Applications，然后打开应用。也可以下载同架构的 ZIP，解压后把应用移入 Applications。应用已包含 Python、DWS 和 glab，无需单独安装运行组件。
+要求 **macOS 14 或更新版本**。打开 DMG，将「跃鲤.app」拖入 Applications，然后打开应用。也可以下载同架构的 ZIP，解压后把应用移入 Applications。应用已包含 Python、DWS 和 glab，无需单独安装运行组件。
 
 当前安装包使用临时签名，未经过 Apple 公证。首次下载若被 macOS 拦截，请在「系统设置 → 隐私与安全性」中选择「仍要打开」。
 
@@ -26,7 +26,7 @@
 2. 在「消息来源」中查询并选择审批请求群和人员来源群，确认 GitLab 地址。
 3. 根据需要设置锁屏、暂停、排队、回执和通知策略，然后开始监听。
 
-应用默认自动检查当前账号并开始监听；首次使用尚未登录时，可在设置中完成登录再开始。更新时退出旧版并替换 App，已有配置会继续保留。
+应用默认自动检查当前账号并开始监听；首次使用尚未登录时，可在设置中完成登录再开始。若已安装旧版，请先退出并从 Applications 中移除「审批台.app」，再安装「跃鲤.app」，避免两个登录项同时存在。首次以跃鲤启动时，会把旧 `ApprovalDesk/settings.json` 自动迁移到 `LeapKoi/settings.json`，账号 Token、群聊和策略保持不变。
 
 ## 功能
 
@@ -40,7 +40,7 @@
 - **完整处理策略**：锁屏、手动暂停、新消息排队或丢弃、队列溢出、并发数、超时、重试与回执条件均可配置。
 - **原生桌面体验**：独立设置窗口、原生左上角关闭按钮、深浅色、登录启动、通知定位请求与统一应用图标。
 
-应用图标、菜单栏与侧栏共用「合流＋勾选」标志。应用图标保留玻璃底座；菜单栏使用透明单色模板，适配系统背景。暂停和异常只调整下方节点里的符号。[浅色图标](docs/previews/icon-family-light.png) · [深色图标](docs/previews/icon-family-dark.png)。
+应用图标以米白宣纸为底，用水墨锦鲤、朱砂日点和薄荷鱼鳍表达「鲤鱼跃龙门」的放行与跃迁。菜单栏和侧栏使用从原图提取的单色锦鲤模板；朱砂点随监听、暂停和异常状态变化。[浅色图标](docs/previews/icon-family-light.png) · [深色图标](docs/previews/icon-family-dark.png)。
 
 ## 默认行为
 
@@ -62,7 +62,7 @@
 配置使用普通 JSON，路径为：
 
 ```text
-~/Library/Application Support/ApprovalDesk/settings.json
+~/Library/Application Support/LeapKoi/settings.json
 ```
 
 应用不使用钥匙串。DWS/glab 继续管理已有登录状态，应用中填写的 Token 默认遮蔽显示，实际内容仍保存在配置文件中。任务历史、队列和运行详情保存在内存；退出后清空，监听停止或引擎重启后不会恢复队列，也不会补做未处理消息。
@@ -75,11 +75,11 @@ DWS 的配套运行库会展开到应用支持目录下按版本区分的 Compon
 
 ```sh
 uv python install
-APPROVALDESK_PYTHON="$(uv python find --managed-python)"
-"$APPROVALDESK_PYTHON" -B scripts/prepare_components.py
-"$APPROVALDESK_PYTHON" -B scripts/build_app.py --configuration release --zip --dmg \
+LEAPKOI_PYTHON="$(uv python find --managed-python)"
+"$LEAPKOI_PYTHON" -B scripts/prepare_components.py
+"$LEAPKOI_PYTHON" -B scripts/build_app.py --configuration release --zip --dmg \
   --components-dir ".cache/build-components/$(uname -m)"
-"$APPROVALDESK_PYTHON" -B scripts/check_bundle.py --app dist/审批台.app --archives-dir dist
+"$LEAPKOI_PYTHON" -B scripts/check_bundle.py --app dist/跃鲤.app --archives-dir dist
 ```
 
 构建产物位于 `dist/`。运行组件版本和官方归档校验值固定在 `Resources/components.lock.json`，Python 版本同时由 `.python-version` 指定。

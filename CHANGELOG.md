@@ -1,10 +1,31 @@
 # 更新记录
 
+## 0.2.0
+
+跃鲤品牌版。产品视觉、应用身份和发布仓库统一为「跃鲤 / LeapKoi」。
+
+- 产品更名为「跃鲤」，英文名与可执行文件改为 `LeapKoi`，应用显示为「跃鲤.app」。
+- Bundle ID 更新为 `io.github.notochen.leapkoi`，配置目录迁移到 `~/Library/Application Support/LeapKoi`。
+- 首次启动会从旧 `ApprovalDesk/settings.json` 一次性迁移群聊、策略和 Token；DWS/glab 登录态不受影响。
+- 应用图标改为米白宣纸上的水墨锦鲤、朱砂日点与薄荷鱼鳍；菜单栏和侧栏使用从原图提取的单色鱼形模板，小尺寸下仍保留辨识度。
+- 仓库地址更新为 `NotoChen/LeapKoi`，安装包、DMG、ZIP 和校验文件统一使用 `LeapKoi` 前缀。
+
+### 下载与安装
+
+| Mac 类型 | 推荐安装包 |
+| --- | --- |
+| Apple Silicon（M 系列） | `LeapKoi-0.2.0-macos-arm64.dmg` |
+| Intel | `LeapKoi-0.2.0-macos-x86_64.dmg` |
+
+要求 macOS 14 或更新版本，macOS 26 及以上使用系统 Liquid Glass。打开 DMG，将「跃鲤.app」拖入 Applications。首次启动只显示菜单栏图标，可从菜单栏进入设置并登录账号。
+
+当前安装包使用临时签名，未经过 Apple 公证。首次下载若被 macOS 拦截，请在「系统设置 → 隐私与安全性」中选择「仍要打开」。
+
 ## 0.1.0
 
-首个 GitHub 发行版，包含已经完成实机验收的 macOS 原生审批台功能。
+首个 GitHub 发行版，包含已经完成实机验收的 macOS 原生审批功能。
 
-- 原生 SwiftUI + AppKit 界面，支持 Liquid Glass、深浅色、菜单栏常驻和统一图标。
+- 原生 SwiftUI + AppKit 界面，支持 Liquid Glass、深浅色和菜单栏常驻。
 - 通过钉钉接收审批请求，按来源群成员筛选发送人；显示真实头像和处理进度。
 - 集成 GitLab 审批、合并、合并人核验及回执策略，正确处理已由其他人合并的 MR。
 - 支持监听期间查询和选择群聊，同群重选不会误报需要重新监听。

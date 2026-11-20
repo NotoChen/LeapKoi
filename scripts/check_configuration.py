@@ -18,7 +18,7 @@ from configuration import DEFAULTS, validate  # noqa: E402
 
 
 def native_defaults() -> dict:
-    with tempfile.TemporaryDirectory(prefix="approvaldesk-config-") as folder:
+    with tempfile.TemporaryDirectory(prefix="leapkoi-config-") as folder:
         binary = Path(folder) / "config-contract"
         subprocess.run(
             [
@@ -26,7 +26,7 @@ def native_defaults() -> dict:
                 "-sdk",
                 sdk_path(),
                 "-parse-as-library",
-                str(root / "Sources/ApprovalDesk/Models.swift"),
+                str(root / "Sources/LeapKoi/Models.swift"),
                 str(root / "Tools/ConfigContract.swift"),
                 "-o",
                 str(binary),

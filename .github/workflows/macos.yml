@@ -38,34 +38,34 @@ jobs:
         shell: bash
         run: |
           uv python install
-          APPROVALDESK_PYTHON="$(uv python find --managed-python)"
-          echo "APPROVALDESK_PYTHON=$APPROVALDESK_PYTHON" >> "$GITHUB_ENV"
-          "$APPROVALDESK_PYTHON" --version
+          LEAPKOI_PYTHON="$(uv python find --managed-python)"
+          echo "LEAPKOI_PYTHON=$LEAPKOI_PYTHON" >> "$GITHUB_ENV"
+          "$LEAPKOI_PYTHON" --version
           swift --version
           test "$(uname -m)" = "${{ matrix.arch }}"
       - name: Check version and release notes
         shell: bash
         run: |
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            "$APPROVALDESK_PYTHON" -B scripts/release_metadata.py --tag "$GITHUB_REF_NAME"
+            "$LEAPKOI_PYTHON" -B scripts/release_metadata.py --tag "$GITHUB_REF_NAME"
           else
-            "$APPROVALDESK_PYTHON" -B scripts/release_metadata.py
+            "$LEAPKOI_PYTHON" -B scripts/release_metadata.py
           fi
       - name: Engine tests
-        run: '"$APPROVALDESK_PYTHON" -B -m unittest discover -s Tests/EngineTests -v'
+        run: '"$LEAPKOI_PYTHON" -B -m unittest discover -s Tests/EngineTests -v'
       - name: Configuration contract
-        run: '"$APPROVALDESK_PYTHON" -B scripts/check_configuration.py'
+        run: '"$LEAPKOI_PYTHON" -B scripts/check_configuration.py'
       - name: Native tests
         run: swift test -j 2
       - name: Download pinned components
-        run: '"$APPROVALDESK_PYTHON" -B scripts/prepare_components.py'
+        run: '"$LEAPKOI_PYTHON" -B scripts/prepare_components.py'
       - name: Build DMG and ZIP
         run: >-
-          "$APPROVALDESK_PYTHON" -B scripts/build_app.py --configuration release --zip --dmg
+          "$LEAPKOI_PYTHON" -B scripts/build_app.py --configuration release --zip --dmg
           --components-dir ".cache/build-components/${{ matrix.arch }}"
       - name: Verify app and both archives
         run: >-
-          "$APPROVALDESK_PYTHON" -B scripts/check_bundle.py --app dist/审批台.app
+          "$LEAPKOI_PYTHON" -B scripts/check_bundle.py --app dist/跃鲤.app
           --arch "${{ matrix.arch }}" --archives-dir dist
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -107,7 +107,7 @@ jobs:
             fi
           else
             gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
-              --title "审批台 $GITHUB_REF_NAME" --notes-file release-notes.md
+              --title "跃鲤 $GITHUB_REF_NAME" --notes-file release-notes.md
           fi
           gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest --notes-file release-notes.md

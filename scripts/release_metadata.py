@@ -33,7 +33,7 @@ def release_notes(version):
 
 
 def write_checksums(directory, version):
-    expected = {f"ApprovalDesk-{version}-macos-{arch}.{suffix}"
+    expected = {f"LeapKoi-{version}-macos-{arch}.{suffix}"
                 for arch in ("arm64", "x86_64") for suffix in ("dmg", "zip")}
     actual = {path.name for path in directory.iterdir() if path.suffix in {".dmg", ".zip"}}
     if actual != expected:
@@ -61,7 +61,7 @@ def main():
     notes = release_notes(version)
     if args.assets_dir:
         write_checksums(args.assets_dir, version)
-    print(notes if args.notes else f"ApprovalDesk {version} (Build {build})", end="" if args.notes else "\n")
+    print(notes if args.notes else f"LeapKoi {version} (Build {build})", end="" if args.notes else "\n")
 
 
 if __name__ == "__main__":

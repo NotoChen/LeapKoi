@@ -1,7 +1,7 @@
 import AppKit
 #if canImport(XCTest)
 import XCTest
-@testable import ApprovalDesk
+@testable import LeapKoi
 #endif
 
 @MainActor

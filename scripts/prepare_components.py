@@ -19,7 +19,7 @@ def download(url, destination, expected_sha256):
         return
     for attempt in range(3):
         try:
-            request = urllib.request.Request(url, headers={"User-Agent": "ApprovalDesk-build"})
+            request = urllib.request.Request(url, headers={"User-Agent": "LeapKoi-build"})
             with urllib.request.urlopen(request, timeout=45) as response:
                 data = response.read()
             if hashlib.sha256(data).hexdigest() != expected_sha256:

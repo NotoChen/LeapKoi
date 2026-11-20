@@ -44,6 +44,8 @@ def check_app(app, architecture, tag=None):
     require(manifest["app_version"] == version and manifest["app_build"] == build,
             "安装包版本与 Info.plist 不一致")
     require(manifest["architecture"] == architecture, "安装包架构清单不一致")
+    require((resources / "AppIcon.icns").is_file(), "安装包缺少应用图标")
+    require((resources / "MenuBarKoi.png").is_file(), "安装包缺少菜单栏锦鲤模板")
     run(["codesign", "--verify", "--deep", "--strict", app])
     for path in app.rglob("*"):
         if path.is_symlink() or not path.is_file():
@@ -55,10 +57,10 @@ def check_app(app, architecture, tag=None):
         verify_library_paths(path)
     before = fingerprint(app)
     python = resources / "Runtime/bin/python3"
-    with tempfile.TemporaryDirectory(prefix="approvaldesk-bundle-check-") as directory:
+    with tempfile.TemporaryDirectory(prefix="leapkoi-bundle-check-") as directory:
         env = os.environ.copy()
         env.update(PATH="/usr/bin:/bin:/usr/sbin:/sbin", PYTHONNOUSERSITE="1", PYTHONDONTWRITEBYTECODE="1",
-                   APPROVALDESK_DATA_DIR=directory)
+                   LEAPKOI_DATA_DIR=directory)
         for name in ("PYTHONHOME", "PYTHONPATH", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH"):
             env.pop(name, None)
         probe = run([python, "-B", "-c", "import json, ssl, ctypes, fcntl, platform; print(platform.python_version())"],
@@ -105,9 +107,9 @@ def main():
     if not args.archives_dir:
         return
     version, _ = app_metadata(app / "Contents/Info.plist")
-    prefix = f"ApprovalDesk-{version}-macos-{args.arch}"
+    prefix = f"LeapKoi-{version}-macos-{args.arch}"
     archives = args.archives_dir.resolve()
-    with tempfile.TemporaryDirectory(prefix="approvaldesk-archive-check-") as directory:
+    with tempfile.TemporaryDirectory(prefix="leapkoi-archive-check-") as directory:
         root = Path(directory)
         extracted = root / "zip"
         run(["ditto", "-x", "-k", archives / f"{prefix}.zip", extracted])

@@ -118,11 +118,15 @@ def executable(name: str, settings: dict[str, Any]) -> str | None:
     return shutil.which(name)
 
 
+def data_dir() -> Path:
+    configured = os.environ.get("LEAPKOI_DATA_DIR") or os.environ.get("APPROVALDESK_DATA_DIR")
+    return Path(configured or Path.home() / "Library/Application Support/LeapKoi")
+
+
 def stage_dws(source: Path) -> Path:
     """DWS expands native runtime sidecars next to itself; keep the .app immutable."""
     digest = hashlib.sha256(source.read_bytes()).hexdigest()[:16]
-    folder = Path(os.environ.get("APPROVALDESK_DATA_DIR", str(Path.home() / "Library/Application Support/ApprovalDesk")))
-    folder = folder / "Components" / f"dws-{digest}"
+    folder = data_dir() / "Components" / f"dws-{digest}"
     folder.mkdir(parents=True, exist_ok=True)
     destination = folder / "dws"
     if not destination.exists():

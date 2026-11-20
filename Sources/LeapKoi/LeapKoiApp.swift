@@ -43,7 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 }
 
 @main
-struct ApprovalDeskApp: App {
+struct LeapKoiApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject private var model: AppModel
 
@@ -76,7 +76,7 @@ struct ApprovalDeskApp: App {
     }
 
     private var workbench: some Scene {
-        Window("审批台", id: "main") {
+        Window("跃鲤", id: "main") {
             MainView().environmentObject(model).tint(.primary)
         }
         .defaultSize(width: 1180, height: 780)
@@ -103,11 +103,11 @@ private struct MenuBarIcon: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Image(nsImage: ApprovalMark.menuImage(paused: model.paused, status: model.status))
+        Image(nsImage: KoiMark.menuImage(paused: model.paused, status: model.status))
             .renderingMode(.template)
-            .accessibilityLabel("审批台")
+            .accessibilityLabel("跃鲤")
             .accessibilityValue(statusTitle(model.status))
-            .help("审批台 · \(statusTitle(model.status))")
+            .help("跃鲤 · \(statusTitle(model.status))")
             .onAppear {
                 model.installMainWindowOpener {
                     NSApp.unhide(nil)

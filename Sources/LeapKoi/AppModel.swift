@@ -75,15 +75,55 @@ final class AppModel: ObservableObject {
     var workerStableSeconds: TimeInterval = 8
     var startupTimeoutOverride: TimeInterval?
 
+    static func migrateLegacyConfiguration(
+        from legacy: URL,
+        to current: URL,
+        fileManager: FileManager = .default
+    ) throws {
+        guard !fileManager.fileExists(atPath: current.path),
+              fileManager.fileExists(atPath: legacy.path) else { return }
+        try fileManager.createDirectory(
+            at: current.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try fileManager.copyItem(at: legacy, to: current)
+    }
+
+    private static func defaultConfiguration() -> (url: URL, migrationError: Error?) {
+        let fileManager = FileManager.default
+        let support = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support")
+        let current = support.appendingPathComponent("LeapKoi/settings.json")
+        let legacy = support.appendingPathComponent("ApprovalDesk/settings.json")
+        do {
+            try migrateLegacyConfiguration(from: legacy, to: current, fileManager: fileManager)
+            return (current, nil)
+        } catch {
+            return (current, error)
+        }
+    }
+
     init(configURL: URL? = nil, demo: Bool? = nil, client: EngineConnection? = nil, loginItem: LoginItemManaging? = nil) {
         self.client = client ?? EngineClient()
         self.loginItem = loginItem ?? SystemLoginItemManager()
         let arguments = ProcessInfo.processInfo.arguments
         self.isDemo = demo ?? arguments.contains("--demo")
         let argumentURL: URL? = arguments.firstIndex(of: "--config").flatMap { arguments.indices.contains($0 + 1) ? URL(fileURLWithPath: arguments[$0 + 1]) : nil }
-        self.configURL = configURL ?? argumentURL ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/ApprovalDesk/settings.json")
+        var migrationError: Error?
+        if let configURL {
+            self.configURL = configURL
+        } else if let argumentURL {
+            self.configURL = argumentURL
+        } else {
+            let configuration = Self.defaultConfiguration()
+            self.configURL = configuration.url
+            migrationError = configuration.migrationError
+        }
         do { settings = try AppSettings.load(from: self.configURL) }
         catch { settings = AppSettings(); configurationIssue = "配置读取失败：\(error.localizedDescription)" }
+        if let migrationError, configurationIssue == nil {
+            configurationIssue = "旧版配置迁移失败：\(migrationError.localizedDescription)"
+        }
         self.client.onEvent = { [weak self] event in self?.receive(event) }
         self.client.onExit = { [weak self] in
             guard let self else { return }
@@ -630,7 +670,7 @@ final class AppModel: ObservableObject {
     var loginItemDetail: String {
         if let loginItemIssue { return loginItemIssue }
         if updatingLoginItem { return "正在更新 macOS 登录启动项…" }
-        if !isDemo && loginItemStatus == .requiresApproval { return "请在系统设置 → 通用 → 登录项中允许审批台" }
+        if !isDemo && loginItemStatus == .requiresApproval { return "请在系统设置 → 通用 → 登录项中允许跃鲤" }
         if !isDemo && loginItemStatus == .enabled { return "已加入 macOS 登录项" }
         return "登录后自动运行，窗口是否显示由下方选项决定"
     }
@@ -790,7 +830,7 @@ final class AppModel: ObservableObject {
             }
         case "auth_output": authText += event["text"] as? String ?? ""
         case "notification":
-            deliverNotification(title: event["title"] as? String ?? "审批台", message: event["message"] as? String ?? "", subtitle: event["subtitle"] as? String ?? "", taskId: event["task_id"] as? String ?? "")
+            deliverNotification(title: event["title"] as? String ?? "跃鲤", message: event["message"] as? String ?? "", subtitle: event["subtitle"] as? String ?? "", taskId: event["task_id"] as? String ?? "")
         case "error":
             if event["command"] as? String == "groups" {
                 guard acceptsGroupEvent(event) else { return }

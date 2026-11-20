@@ -70,14 +70,14 @@ struct AppSettings: Codable, Equatable {
         guard FileManager.default.fileExists(atPath: url.path) else { return AppSettings() }
         let source = try JSONSerialization.jsonObject(with: Data(contentsOf: url))
         guard let dictionary = source as? [String: Any] else {
-            throw NSError(domain: "ApprovalDesk", code: 1, userInfo: [NSLocalizedDescriptionKey: "配置文件需要是 JSON 对象"])
+            throw NSError(domain: "LeapKoi", code: 1, userInfo: [NSLocalizedDescriptionKey: "配置文件需要是 JSON 对象"])
         }
         let combined = AppSettings().dictionary().merging(dictionary) { _, new in new }
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         var settings = try decoder.decode(AppSettings.self, from: JSONSerialization.data(withJSONObject: combined))
         guard settings.schemaVersion == AppSettings.currentSchemaVersion else {
-            throw NSError(domain: "ApprovalDesk", code: 3, userInfo: [NSLocalizedDescriptionKey: "配置文件版本与当前应用不一致，请检查版本或迁移配置"])
+            throw NSError(domain: "LeapKoi", code: 3, userInfo: [NSLocalizedDescriptionKey: "配置文件版本与当前应用不一致，请检查版本或迁移配置"])
         }
         // The current schema is still v1. Keeping the field and this guard
         // makes future migrations explicit instead of silently accepting them.
@@ -86,13 +86,13 @@ struct AppSettings: Codable, Equatable {
             settings.gitlabHost = host
         }
         if let issue = settings.validationIssue {
-            throw NSError(domain: "ApprovalDesk", code: 2, userInfo: [NSLocalizedDescriptionKey: issue])
+            throw NSError(domain: "LeapKoi", code: 2, userInfo: [NSLocalizedDescriptionKey: issue])
         }
         return settings
     }
     func save(to url: URL) throws {
         if let issue = validationIssue {
-            throw NSError(domain: "ApprovalDesk", code: 2, userInfo: [NSLocalizedDescriptionKey: issue])
+            throw NSError(domain: "LeapKoi", code: 2, userInfo: [NSLocalizedDescriptionKey: issue])
         }
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         var normalized = self
@@ -397,12 +397,12 @@ func statusTitle(_ status: String) -> String {
 }
 
 extension Color {
-    static let ink = Color(nsColor: NSColor(name: "ApprovalDeskInk") { appearance in
+    static let ink = Color(nsColor: NSColor(name: "LeapKoiInk") { appearance in
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             ? NSColor(white: 0.94, alpha: 1)
             : NSColor(white: 0.12, alpha: 1)
     })
-    static let action = Color(nsColor: NSColor(name: "ApprovalDeskAction") { appearance in
+    static let action = Color(nsColor: NSColor(name: "LeapKoiAction") { appearance in
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             ? NSColor(white: 0.88, alpha: 1)
             : NSColor(white: 0.19, alpha: 1)

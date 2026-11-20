@@ -1,6 +1,6 @@
 #if canImport(XCTest)
 import XCTest
-@testable import ApprovalDesk
+@testable import LeapKoi
 #else
 import Foundation
 #endif
@@ -99,6 +99,25 @@ final class AppModelTests: XCTestCase {
         model.receive(["type": "operation_finished", "command": "groups", "request_id": client.groupRequestID])
         XCTAssertEqual(model.groupOptions.count, 1)
         model.selectGroup(model.groupOptions[0])
+    }
+
+    func testLegacyConfigurationMigratesOnce() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let legacy = folder.appendingPathComponent("ApprovalDesk/settings.json")
+        let current = folder.appendingPathComponent("LeapKoi/settings.json")
+        var oldSettings = AppSettings()
+        oldSettings.approvalGroup = "旧版审批群"
+        try oldSettings.save(to: legacy)
+
+        try AppModel.migrateLegacyConfiguration(from: legacy, to: current)
+        XCTAssertEqual(try AppSettings.load(from: current).approvalGroup, "旧版审批群")
+
+        var newerLegacySettings = AppSettings()
+        newerLegacySettings.approvalGroup = "不应覆盖"
+        try newerLegacySettings.save(to: legacy)
+        try AppModel.migrateLegacyConfiguration(from: legacy, to: current)
+        XCTAssertEqual(try AppSettings.load(from: current).approvalGroup, "旧版审批群")
     }
 
     func testStartupReadsAccountsWithoutStartingListener() throws {

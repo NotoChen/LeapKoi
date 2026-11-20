@@ -1,6 +1,6 @@
 #if canImport(XCTest)
 import XCTest
-@testable import ApprovalDesk
+@testable import LeapKoi
 #endif
 import AppKit
 import Foundation

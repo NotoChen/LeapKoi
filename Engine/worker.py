@@ -357,8 +357,16 @@ class Controller:
             except ValueError:
                 continue
             if args and Path(args[0]).name.startswith("python") and any(Path(a).name == "code_approval_listener.py" for a in args[1:]) and not any(a in args for a in ("--check", "--stop", "--status")):
-                raise core.AutomationError(f"桌面脚本仍在运行（PID {parts[0]}）。请先在原终端停止，再从审批台开始监听。")
-        folder = Path.home() / "Library/Application Support/ApprovalDesk"
+                raise core.AutomationError(f"桌面脚本仍在运行（PID {parts[0]}）。请先在原终端停止，再从跃鲤开始监听。")
+        legacy_lock = Path.home() / "Library/Application Support/ApprovalDesk/engine.lock"
+        if legacy_lock.exists():
+            with legacy_lock.open("r+") as legacy_handle:
+                try:
+                    fcntl.flock(legacy_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise core.AutomationError("另一个跃鲤实例已经在监听")
+                fcntl.flock(legacy_handle.fileno(), fcntl.LOCK_UN)
+        folder = core.data_dir()
         folder.mkdir(parents=True, exist_ok=True)
         self.instance_handle = (folder / "engine.lock").open("a+")
         try:
@@ -366,7 +374,7 @@ class Controller:
         except BlockingIOError:
             self.instance_handle.close()
             self.instance_handle = None
-            raise core.AutomationError("另一个审批台实例已经在监听")
+            raise core.AutomationError("另一个跃鲤实例已经在监听")
 
     def start(self, *, settings=None, request_id=None):
         if self.runtime:

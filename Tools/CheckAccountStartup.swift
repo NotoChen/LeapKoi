@@ -99,6 +99,6 @@ struct CheckAccountStartup {
     }
 
     static func failure(_ message: String) -> NSError {
-        NSError(domain: "ApprovalDeskStartupProbe", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+        NSError(domain: "LeapKoiStartupProbe", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
     }
 }

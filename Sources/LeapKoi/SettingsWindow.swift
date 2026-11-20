@@ -14,7 +14,7 @@ final class SettingsWindowController: NSWindowController {
             backing: .buffered, defer: false
         )
         window.title = "设置"
-        window.identifier = NSUserInterfaceItemIdentifier("approvaldesk.settings")
+        window.identifier = NSUserInterfaceItemIdentifier("leapkoi.settings")
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = false
         window.isReleasedWhenClosed = false

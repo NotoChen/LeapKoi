@@ -58,7 +58,7 @@ struct MainView: View {
         .background(GlassWindowBackground())
         .frame(minWidth: 1020, minHeight: 640)
         .toolbar {
-            ToolbarItem(placement: .principal) { Text("审批台").font(.system(size: 13, weight: .semibold)) }
+            ToolbarItem(placement: .principal) { Text("跃鲤").font(.system(size: 13, weight: .semibold)) }
             ToolbarItemGroup(placement: .primaryAction) {
                 StatusBadge(status: model.status)
                 if model.isActive {
@@ -80,11 +80,11 @@ struct SidebarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
-                Image(nsImage: ApprovalMark.image).renderingMode(.template).resizable().frame(width: 23, height: 23).foregroundStyle(Color.brand)
+                Image(nsImage: KoiMark.image).renderingMode(.template).resizable().frame(width: 23, height: 23).foregroundStyle(Color.brand)
                     .frame(width: 38, height: 38).contentSurface(radius: 12)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("审批台").font(.system(size: 17, weight: .semibold)).tracking(-0.4)
-                    Text("ApprovalDesk").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text("跃鲤").font(.system(size: 17, weight: .semibold)).tracking(-0.4)
+                    Text("LeapKoi").font(.system(size: 10)).foregroundStyle(.secondary)
                 }
             }.padding(.horizontal, 18).padding(.top, 24).padding(.bottom, 31)
             Text("工作空间").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary).padding(.horizontal, 22).padding(.bottom, 10)
@@ -401,12 +401,12 @@ struct EmptyWorkspace: View {
                 if model.isActive {
                     Image(systemName: "bubble.left.and.bubble.right").font(.system(size: 32, weight: .light))
                 } else {
-                    Image(nsImage: ApprovalMark.image).renderingMode(.template).resizable().frame(width: 36, height: 36)
+                    Image(nsImage: KoiMark.image).renderingMode(.template).resizable().frame(width: 36, height: 36)
                 }
             }.foregroundStyle(.primary).frame(width: 72, height: 72).glassChrome(radius: 22)
             VStack(alignment: .leading, spacing: 10) {
                 Text(model.isActive ? "准备好接收下一条请求" : "让审批自然地完成").font(.system(size: 27, weight: .semibold))
-                Text(model.isActive ? "\(model.settings.senderGroup)的成员在\(model.settings.approvalGroup)中 @你后，请求会出现在这里。" : "连接钉钉和 GitLab，选择消息来源。审批台会在菜单栏安静地等待，并把每一步的结果留在这里。")
+                Text(model.isActive ? "\(model.settings.senderGroup)的成员在\(model.settings.approvalGroup)中 @你后，请求会出现在这里。" : "连接钉钉和 GitLab，选择消息来源。跃鲤会在菜单栏安静地等待，并把每一步的结果留在这里。")
                     .font(.system(size: 13)).foregroundStyle(.secondary).lineSpacing(5).fixedSize(horizontal: false, vertical: true)
             }
             if !model.isActive {
@@ -449,8 +449,8 @@ struct MenuPanel: View {
         GlassGroup {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(spacing: 9) {
-                    Image(nsImage: ApprovalMark.image).renderingMode(.template).accessibilityHidden(true)
-                    Text("审批台").font(.system(size: 16, weight: .semibold))
+                    Image(nsImage: KoiMark.image).renderingMode(.template).accessibilityHidden(true)
+                    Text("跃鲤").font(.system(size: 16, weight: .semibold))
                     Spacer()
                     StatusBadge(status: model.status)
                 }
@@ -468,7 +468,7 @@ struct MenuPanel: View {
                     Button("打开工作台") { model.openMainWindow?() }.buttonStyle(.borderless)
                     Spacer()
                     Button { model.openSettingsWindow?() } label: { Image(systemName: "gearshape") }.buttonStyle(.borderless)
-                    Menu { Button("停止监听") { model.stop() }; Button("退出审批台") { NSApp.terminate(nil) } } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).frame(width: 20)
+                    Menu { Button("停止监听") { model.stop() }; Button("退出跃鲤") { NSApp.terminate(nil) } } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).frame(width: 20)
                 }.font(.system(size: 11))
             }.padding(21).frame(width: 315).glassChrome(radius: 24)
         }.background(GlassWindowBackground())

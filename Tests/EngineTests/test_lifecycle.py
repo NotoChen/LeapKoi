@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import sys
 import threading
@@ -7,13 +8,21 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "Engine"))
 import listener_core as core
-from configuration import DEFAULTS
+from configuration import DEFAULTS, data_dir
 from lifecycle import startup_decision
 from protocol import Events, EventConsole, EventNotifier
 from runtime import ApplicationRuntime, PolicyGate
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_leapkoi_data_directory_precedes_legacy_environment(self):
+        with patch.dict(os.environ, {"LEAPKOI_DATA_DIR": "/tmp/leapkoi-new",
+                                     "APPROVALDESK_DATA_DIR": "/tmp/approvaldesk-old"}):
+            self.assertEqual(data_dir(), Path("/tmp/leapkoi-new"))
+        with patch.dict(os.environ, {"APPROVALDESK_DATA_DIR": "/tmp/approvaldesk-old"}, clear=False):
+            os.environ.pop("LEAPKOI_DATA_DIR", None)
+            self.assertEqual(data_dir(), Path("/tmp/approvaldesk-old"))
+
     def test_retryable_0_2_1_budget(self):
         for retryable, expected in [(False, 0), (True, 2), (None, 1)]:
             decision = startup_decision([json.dumps({"error": {"retryable": retryable}})], 1)

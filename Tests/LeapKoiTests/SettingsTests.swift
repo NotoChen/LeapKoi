@@ -1,6 +1,6 @@
 #if canImport(XCTest)
 import XCTest
-@testable import ApprovalDesk
+@testable import LeapKoi
 #else
 import Foundation
 // The same checks also run on Macs with Command Line Tools and no XCTest SDK.
@@ -235,6 +235,7 @@ final class SettingsTests: XCTestCase {
         AvatarTests().testAvatarHostAllowlistRejectsUnsafeURLs()
         print("3 native avatar loading checks passed")
         let app = AppModelTests()
+        try app.testLegacyConfigurationMigratesOnce()
         try app.testStartupReadsAccountsWithoutStartingListener()
         try app.testOneAccountFailureKeepsOtherIdentityAndErrorDetail()
         try app.testOpeningSettingsDuringStartupDefersProfileLoadUntilOperationFinishes()
@@ -266,7 +267,7 @@ final class SettingsTests: XCTestCase {
         try app.testRejectedGroupSendDoesNotLeaveTheModelBusy()
         try app.testPendingTextEditIsFlushedBeforeGroupSearch()
         try app.testCompletedCountIncludesPartialTasks()
-        print("31 native startup, login-item and account checks passed")
+        print("32 native startup, login-item and account checks passed")
         try app.testBothGroupSelectorsDisplayCandidatesAndSaveTheSelectedGroup()
         try app.testFailedGroupSearchCanBeRetriedAndAnEmptyResultEndsLoading()
         try app.testGroupSelectionWhileActiveSavesForNextStartAndKeepsTasks()

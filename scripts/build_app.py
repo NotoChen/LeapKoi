@@ -30,11 +30,11 @@ def copy_executable(source, target):
 
 
 def sdk_path():
-    override = os.environ.get("APPROVALDESK_SDK", "").strip()
+    override = (os.environ.get("LEAPKOI_SDK") or os.environ.get("APPROVALDESK_SDK") or "").strip()
     if override:
         selected = Path(override).expanduser()
         if not selected.is_dir():
-            raise RuntimeError(f"APPROVALDESK_SDK 不是有效目录：{selected}")
+            raise RuntimeError(f"LEAPKOI_SDK 不是有效目录：{selected}")
         return str(selected)
     selected = subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
     if "/CommandLineTools/" not in selected:
@@ -87,12 +87,12 @@ def verify_architecture(path, architecture):
 
 
 def create_dmg(app, destination, version):
-    with tempfile.TemporaryDirectory(prefix="approvaldesk-dmg-") as directory:
+    with tempfile.TemporaryDirectory(prefix="leapkoi-dmg-") as directory:
         stage = Path(directory)
         run(["ditto", app, stage / app.name])
         (stage / "Applications").symlink_to("/Applications", target_is_directory=True)
         shutil.copy2(ROOT / "Resources/Install.txt", stage / "安装说明.txt")
-        run(["hdiutil", "create", "-ov", "-quiet", "-volname", f"审批台 {version}",
+        run(["hdiutil", "create", "-ov", "-quiet", "-volname", f"跃鲤 {version}",
              "-srcfolder", stage, "-fs", "HFS+", "-format", "UDZO", destination])
     run(["hdiutil", "verify", "-quiet", destination])
 
@@ -119,17 +119,17 @@ def main():
     if not args.skip_build:
         run(["swift", "build", "--sdk", sdk, "-c", args.configuration, "-j", "2"], cwd=ROOT)
     bin_path = Path(subprocess.check_output(["swift", "build", "--show-bin-path", "--sdk", sdk, "-c", args.configuration], cwd=ROOT, text=True).strip())
-    binary = bin_path / "ApprovalDesk"
+    binary = bin_path / "LeapKoi"
     if not binary.is_file():
         raise RuntimeError(f"编译产物不存在：{binary}")
-    app = args.output.resolve() / "审批台.app"
+    app = args.output.resolve() / "跃鲤.app"
     if app.exists():
         shutil.rmtree(app)
     contents = app / "Contents"
     resources = contents / "Resources"
     (contents / "MacOS").mkdir(parents=True, exist_ok=True)
     resources.mkdir(parents=True, exist_ok=True)
-    copy_executable(binary, contents / "MacOS/ApprovalDesk")
+    copy_executable(binary, contents / "MacOS/LeapKoi")
     shutil.copy2(ROOT / "Resources/Info.plist", contents / "Info.plist")
     shutil.copytree(ROOT / "Engine", resources / "Engine", dirs_exist_ok=True, ignore=ignored)
 
@@ -175,14 +175,15 @@ def main():
                 target.write_bytes(response.read())
 
     icon = ROOT / "Resources/AppIcon.icns"
-    icon_sources = [ROOT / "Sources/ApprovalDesk/ApprovalMark.swift", ROOT / "scripts/create_icon.swift"]
+    menu_mark = ROOT / "Resources/MenuBarKoi.png"
     iconset = ROOT / ".cache/AppIcon.iconset"
     iconset.mkdir(parents=True, exist_ok=True)
     icon_generator = ROOT / ".cache/create-icon"
-    run(["swiftc", "-sdk", sdk, "-parse-as-library", *icon_sources, "-o", icon_generator])
-    run([icon_generator, iconset])
+    run(["swiftc", "-sdk", sdk, "-parse-as-library", ROOT / "scripts/create_icon.swift", "-o", icon_generator])
+    run([icon_generator, ROOT / "Resources/AppIconSource.png", iconset, menu_mark])
     run(["iconutil", "-c", "icns", iconset, "-o", icon])
     shutil.copy2(icon, resources / "AppIcon.icns")
+    shutil.copy2(menu_mark, resources / "MenuBarKoi.png")
 
     print("正在签名应用及内置组件", flush=True)
     for path in sorted(resources.rglob("*"), key=lambda p: len(p.parts), reverse=True):
@@ -196,20 +197,20 @@ def main():
                 run(["install_name_tool", "-id", "@rpath/" + path.name, path], capture_output=True)
             verify_library_paths(path)
             sign(path)
-    sign(contents / "MacOS/ApprovalDesk")
-    verify_architecture(contents / "MacOS/ApprovalDesk", platform.machine())
+    sign(contents / "MacOS/LeapKoi")
+    verify_architecture(contents / "MacOS/LeapKoi", platform.machine())
     sign(app)
     run(["codesign", "--verify", "--deep", "--strict", app], stdout=subprocess.DEVNULL)
     probe = run([runtime / "bin/python3", "-B", "-c", "import json,ssl,fcntl,subprocess,threading,queue,ctypes; print('内置 Python 可用')"], env={"PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1"}, cwd="/tmp", capture_output=True, text=True)
     print(probe.stdout.strip())
     print(f"应用已构建：{app}")
     if args.zip:
-        archive = app.parent / f"ApprovalDesk-{version}-macos-{platform.machine()}.zip"
+        archive = app.parent / f"LeapKoi-{version}-macos-{platform.machine()}.zip"
         if archive.exists(): archive.unlink()
         run(["ditto", "-c", "-k", "--keepParent", app, archive])
         print(f"分发包：{archive}")
     if args.dmg:
-        disk_image = app.parent / f"ApprovalDesk-{version}-macos-{platform.machine()}.dmg"
+        disk_image = app.parent / f"LeapKoi-{version}-macos-{platform.machine()}.dmg"
         create_dmg(app, disk_image, version)
         print(f"安装映像：{disk_image}")
 

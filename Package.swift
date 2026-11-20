@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "ApprovalDesk",
+    name: "LeapKoi",
     platforms: [.macOS(.v14)],
-    products: [.executable(name: "ApprovalDesk", targets: ["ApprovalDesk"])],
+    products: [.executable(name: "LeapKoi", targets: ["LeapKoi"])],
     targets: [
-        .executableTarget(name: "ApprovalDesk", path: "Sources/ApprovalDesk"),
-        .testTarget(name: "ApprovalDeskTests", dependencies: ["ApprovalDesk"], path: "Tests/ApprovalDeskTests")
+        .executableTarget(name: "LeapKoi", path: "Sources/LeapKoi"),
+        .testTarget(name: "LeapKoiTests", dependencies: ["LeapKoi"], path: "Tests/LeapKoiTests")
     ],
     swiftLanguageModes: [.v5]
 )

@@ -47,7 +47,7 @@ struct SettingsView: View {
                         }.buttonStyle(NavigationButtonStyle())
                     }
                     Spacer()
-                    Text("ApprovalDesk").font(.system(size: 10)).foregroundStyle(.tertiary).padding(14)
+                    Text("LeapKoi").font(.system(size: 10)).foregroundStyle(.tertiary).padding(14)
                 }.padding(.horizontal, 10).frame(width: 180).glassChrome()
                 VStack(spacing: 0) {
                     ScrollView {
@@ -275,7 +275,7 @@ struct SettingsView: View {
                 }
             }
             SettingsSection("启动") {
-                SettingsRow("登录 Mac 时打开审批台", detail: model.loginItemDetail) {
+                SettingsRow("登录 Mac 时打开跃鲤", detail: model.loginItemDetail) {
                     SwitchControl(value: Binding(get: { model.settings.launchAtLogin }, set: model.setLaunchAtLogin)).disabled(model.updatingLoginItem)
                 }
                 Divider()

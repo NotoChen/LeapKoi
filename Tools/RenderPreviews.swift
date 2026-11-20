@@ -156,8 +156,8 @@ private struct IconFamilyPreview: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 25) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Text("审批台").font(.system(size: 23, weight: .semibold))
-                Text("统一图标").font(.system(size: 13)).foregroundStyle(.secondary)
+                Text("跃鲤").font(.system(size: 23, weight: .semibold))
+                Text("水墨锦鲤 · 跃过审批之门").font(.system(size: 13)).foregroundStyle(.secondary)
             }
             HStack(spacing: 38) {
                 VStack(spacing: 10) {
@@ -168,9 +168,9 @@ private struct IconFamilyPreview: View {
                 VStack(alignment: .leading, spacing: 18) {
                     Text("菜单栏").font(.system(size: 13, weight: .medium))
                     HStack(spacing: 22) {
-                        sample("监听中", image: ApprovalMark.image)
-                        sample("暂停 / 锁屏", image: ApprovalMark.pausedImage)
-                        sample("连接异常", image: ApprovalMark.attentionImage)
+                        sample("监听中", image: KoiMark.image)
+                        sample("暂停 / 锁屏", image: KoiMark.pausedImage)
+                        sample("连接异常", image: KoiMark.attentionImage)
                     }
                     Text("上方放大预览 · 下方为 18 pt 实际尺寸")
                         .font(.system(size: 10)).foregroundStyle(.tertiary)
